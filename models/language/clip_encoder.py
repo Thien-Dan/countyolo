@@ -52,10 +52,18 @@ class CLIPTextEncoder(nn.Module):
 
         self.clip.eval()
         with torch.no_grad():
-            # get_text_features() trả về 512-dim — đúng CLIP joint embedding space
             text_feats = self.clip.get_text_features(
                 input_ids=input_ids,
                 attention_mask=attention_mask
-            )  # (N, 512)
+            )
+            
+            # Xử lý các phiên bản transformers trả về object thay vì tensor
+            if not isinstance(text_feats, torch.Tensor):
+                if hasattr(text_feats, 'text_embeds'):
+                    text_feats = text_feats.text_embeds
+                elif hasattr(text_feats, 'pooler_output'):
+                    text_feats = text_feats.pooler_output
+                elif isinstance(text_feats, (tuple, list)):
+                    text_feats = text_feats[0]
 
         return self.projection(text_feats)  # (N, 256)

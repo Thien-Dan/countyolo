@@ -53,8 +53,16 @@ class ExemplarEncoder(nn.Module):
 
         self.clip.eval()
         with torch.no_grad():
-            # get_image_features() → 512-dim CLIP joint space (cùng với get_text_features)
-            image_feats = self.clip.get_image_features(pixel_values=flat_crops)  # (B*N_ex, 512)
+            image_feats = self.clip.get_image_features(pixel_values=flat_crops)
+            
+            # Xử lý các phiên bản transformers trả về object thay vì tensor
+            if not isinstance(image_feats, torch.Tensor):
+                if hasattr(image_feats, 'image_embeds'):
+                    image_feats = image_feats.image_embeds
+                elif hasattr(image_feats, 'pooler_output'):
+                    image_feats = image_feats.pooler_output
+                elif isinstance(image_feats, (tuple, list)):
+                    image_feats = image_feats[0]
 
         projected = self.projection(image_feats)  # (B*N_ex, 256)
         return projected.view(B, N_ex, -1)          # (B, N_ex, 256)
