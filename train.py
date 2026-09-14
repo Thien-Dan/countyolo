@@ -139,8 +139,14 @@ def train():
     epochs = 1 if args.sanity_check else cfg['training']['epochs']
     iterations = 200 if args.sanity_check else len(dataloader)
     
-    if not args.sanity_check and wandb.login(anonymous='allow'):
-        wandb.init(project=cfg['wandb']['project'], name=cfg['wandb']['name'], config=cfg)
+    # WandB setup
+    if not args.sanity_check:
+        if os.environ.get("WANDB_API_KEY"):
+            wandb.init(project=cfg['wandb']['project'], name=cfg['wandb']['name'], config=cfg)
+        else:
+            print("⚠️ Không tìm thấy WANDB_API_KEY. Tắt đồng bộ Weights & Biases để tránh bị treo.")
+            os.environ["WANDB_MODE"] = "disabled"
+            wandb.init(mode="disabled")
 
     # Fetch 1 batch for sanity check
     if args.sanity_check:
