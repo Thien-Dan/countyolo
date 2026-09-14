@@ -49,9 +49,16 @@ def extract_box_density(
     x2 = boxes[:, 3].long()
     y2 = boxes[:, 4].long()
 
+    H, W = sat.shape[2] - 1, sat.shape[3] - 1
+    
+    # Clamp tọa độ để không bị văng ra khỏi kích thước SAT (tránh CUDA index out of bounds)
+    x1 = torch.clamp(x1, 0, W - 1)
+    y1 = torch.clamp(y1, 0, H - 1)
+    x2 = torch.clamp(x2, 0, W - 1)
+    y2 = torch.clamp(y2, 0, H - 1)
+
     # Sanity check: đảm bảo box hợp lệ (x2 >= x1, y2 >= y1)
     # Clamp để tránh negative density thay vì raise exception
-    # (giúp tránh crash trong pipeline khi có boxes bị degenerate)
     x2 = torch.maximum(x1, x2)
     y2 = torch.maximum(y1, y2)
 
