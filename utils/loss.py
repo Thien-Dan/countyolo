@@ -57,7 +57,8 @@ class CountYOLOLoss(nn.Module):
         
         # Chuẩn bị flatten predictions
         flat_cls = pred_cls.view(B, C_cls, -1).permute(0, 2, 1) # (B, N_preds, C_cls)
-        flat_boxes = pred_boxes.view(B, 4, -1).permute(0, 2, 1) # (B, N_preds, 4)
+        # pred_boxes đã được flatten và xử lý scale từ train.py (shape: B, N_preds, 4)
+        flat_boxes = pred_boxes
         
         # 2. MATCHING & LOSS BOX/CLS TỪNG ẢNH
         total_matched = 0

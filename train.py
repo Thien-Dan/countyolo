@@ -155,10 +155,13 @@ def train():
     
     # Khởi tạo data_iter TRƯỚC vòng for epoch → sửa lỗi NameError khi it=0
     data_iter = iter(dataloader)
+    
+    best_loss = float('inf')
         
     for epoch in range(epochs):
         model.train()
         pbar = tqdm(range(iterations), desc=f"Epoch {epoch+1}/{epochs}")
+        epoch_loss = 0.0
         
         for it in pbar:
             if args.sanity_check:
@@ -268,9 +271,19 @@ def train():
             if not args.sanity_check and wandb.run is not None:
                 wandb.log(log_stats)
                 
-        # End epoch
+            epoch_loss += total_loss.item()
+                
+        # End epoch - Save Checkpoints
         if not args.sanity_check:
-            torch.save(model.state_dict(), f"checkpoint_epoch_{epoch}.pth")
+            epoch_loss /= iterations
+            # Lưu model tốt nhất
+            if epoch_loss < best_loss:
+                best_loss = epoch_loss
+                torch.save(model.state_dict(), "checkpoint_best.pth")
+                print(f"Lưu checkpoint tốt nhất tại epoch {epoch+1} (loss: {best_loss:.4f})")
+            
+            # Lưu model mới nhất
+            torch.save(model.state_dict(), "checkpoint_latest.pth")
             
     print("Training finished!")
 
