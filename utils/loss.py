@@ -93,16 +93,28 @@ class CountYOLOLoss(nn.Module):
             target_cls[row_ind, 0] = 1.0 
             loss_cls += F.binary_cross_entropy_with_logits(flat_cls[b], target_cls)
             
-            # Tính Box Loss (L1) - Đối với FSC147, ta có giả định box giả quanh points
-            # Kích thước box giả định (dựa trên trung bình exemplars hoặc cố định)
-            # Ở đây dùng một box giả kích thước 20x20 bao quanh điểm point
-            gt_pts = gt_points[b][col_ind] # (N_gt, 2): [y, x]
-            # gt_pts là [y, x]. Ta tạo box [x1, y1, x2, y2]
+            # Tính Box Loss (L1) - Sử dụng kích thước adaptive từ gt_boxes và định dạng [cx, cy, w, h]
+            if gt_boxes is not None and len(gt_boxes[b]) > 0:
+                g_boxes = gt_boxes[b].to(pred_density.device)
+                box_widths = g_boxes[:, 2] - g_boxes[:, 0]
+                box_heights = g_boxes[:, 3] - g_boxes[:, 1]
+                mean_w = box_widths.mean()
+                mean_h = box_heights.mean()
+            else:
+                mean_w = torch.tensor(20.0, device=pred_density.device)
+                mean_h = torch.tensor(20.0, device=pred_density.device)
+                
+            gt_pts = gt_points[b][col_ind].to(pred_density.device) # (N_matched, 2): [y_scaled, x_scaled]
+            cx = gt_pts[:, 1]                         # x_center
+            cy = gt_pts[:, 0]                         # y_center
+            half_w = mean_w / 2.0
+            half_h = mean_h / 2.0
+            # GT box định dạng [x1, y1, x2, y2] - khớp với định dạng pred_boxes sau decode
             pseudo_gt_boxes = torch.stack([
-                gt_pts[:, 1] - 10, # x1
-                gt_pts[:, 0] - 10, # y1
-                gt_pts[:, 1] + 10, # x2
-                gt_pts[:, 0] + 10  # y2
+                cx - half_w,  # x1
+                cy - half_h,  # y1
+                cx + half_w,  # x2
+                cy + half_h   # y2
             ], dim=1)
             
             loss_box += F.l1_loss(matched_boxes, pseudo_gt_boxes)

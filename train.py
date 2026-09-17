@@ -198,9 +198,18 @@ def train():
                 pred_cls = outputs['cls_scores']
                 pred_boxes = outputs['box_preds']
                 
-                # Flatten pred_boxes (B, 4, H/4, W/4) -> (B, H*W/16, 4)
-                flat_boxes = pred_boxes.view(B, 4, -1).permute(0, 2, 1) # (B, N_preds, 4)
-                N_preds = flat_boxes.size(1)
+                from utils.box_utils import decode_fcos_boxes
+                
+                # Decode boxes từ (l,t,r,b) sang tọa độ ảnh gốc tuyệt đối
+                pred_boxes_scaled = decode_fcos_boxes(pred_boxes, stride=4.0) # (B, N_preds, 4)
+                N_preds = pred_boxes_scaled.size(1)
+                
+                # Đảm bảo box hợp lệ cho hàm Loss (width, height >= 1)
+                x1 = pred_boxes_scaled[..., 0]
+                y1 = pred_boxes_scaled[..., 1]
+                x2 = torch.max(x1 + 1.0, pred_boxes_scaled[..., 2])
+                y2 = torch.max(y1 + 1.0, pred_boxes_scaled[..., 3])
+                pred_boxes_scaled_valid = torch.stack([x1, y1, x2, y2], dim=-1)
                 
                 # Xây dựng base cost dựa trên khoảng cách L1
                 matcher_cost_matrix = []
@@ -210,8 +219,9 @@ def train():
                         matcher_cost_matrix.append(torch.zeros((N_preds, 0), device=device))
                         continue
                     
-                    pred_cx = (flat_boxes[b, :, 0] + flat_boxes[b, :, 2]) / 2
-                    pred_cy = (flat_boxes[b, :, 1] + flat_boxes[b, :, 3]) / 2
+                    # Tính tâm của Bounding Box từ tọa độ ảnh gốc
+                    pred_cx = (pred_boxes_scaled_valid[b, :, 0] + pred_boxes_scaled_valid[b, :, 2]) / 2.0
+                    pred_cy = (pred_boxes_scaled_valid[b, :, 1] + pred_boxes_scaled_valid[b, :, 3]) / 2.0
                     pred_ctrs = torch.stack([pred_cx, pred_cy], dim=1) # (N_preds, 2)
                     
                     gt_pts_xy = points[b][:, [1, 0]]
@@ -219,13 +229,6 @@ def train():
                     # Convert sang float32 vì torch.cdist CUDA không hỗ trợ FP16 (Half)
                     cost_dist = torch.cdist(pred_ctrs.float(), gt_pts_xy.float(), p=1.0)
                     matcher_cost_matrix.append(cost_dist)
-                    
-                pred_boxes_scaled = flat_boxes * 4.0 
-                x1 = pred_boxes_scaled[..., 0]
-                y1 = pred_boxes_scaled[..., 1]
-                x2 = torch.max(x1 + 1, pred_boxes_scaled[..., 2])
-                y2 = torch.max(y1 + 1, pred_boxes_scaled[..., 3])
-                pred_boxes_scaled_valid = torch.stack([x1, y1, x2, y2], dim=-1)
                 
                 cost_dens = matcher.compute_cost_dens(density_targets, pred_boxes_scaled_valid) # (B, N_preds, 1)
                 lambda_dens = matcher.get_lambda_dens(epoch)

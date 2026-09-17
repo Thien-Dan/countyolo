@@ -54,22 +54,25 @@ def extract_prompts(model, router, frame_path, text_prompt="human", device="cuda
         cls_scores = outputs['cls_scores']   # (1, 1, H/4, W/4)
         box_preds = outputs['box_preds']     # (1, 4, H/4, W/4)
         
-        # 3. Trích xuất top-K boxes (Giả lập logic của NMSFreeHead decode)
-        # Tạm giảm top k xuống 5 để test pipeline siêu tốc trên CPU/GPU yếu
+        from utils.box_utils import decode_fcos_boxes
+        
+        # 3. Trích xuất các box dự đoán
+        # Giải mã box từ (l,t,r,b) sang tọa độ ảnh gốc tuyệt đối
+        decoded_boxes = decode_fcos_boxes(box_preds, stride=4.0) # (1, N_preds, 4)
+        
         cls_probs = torch.sigmoid(cls_scores[0, 0]) # (H/4, W/4)
         flat_probs = cls_probs.view(-1)
-        topk_vals, topk_indices = torch.topk(flat_probs, k=min(5, flat_probs.numel()))
         
-        # Ngưỡng tự tin (confidence threshold)
-        mask = topk_vals > 0.0 # Bỏ qua ngưỡng để luôn lấy đủ 5 point cho nhanh
+        # Áp dụng ngưỡng tự tin (confidence threshold) thay vì hardcode 5 vật thể
+        CONF_THRESH = 0.3
+        # Lấy tối đa 300 vật thể có xác suất cao nhất (tránh SAM 2 bị OOM), sau đó lọc qua ngưỡng
+        topk_vals, topk_indices = torch.topk(flat_probs, k=min(300, flat_probs.numel()))
+        
+        mask = topk_vals > CONF_THRESH
         topk_indices = topk_indices[mask]
         
-        # Chuyển index về tọa độ Box
-        flat_boxes = box_preds[0].view(4, -1).permute(1, 0) # (N, 4)
-        selected_boxes = flat_boxes[topk_indices] # [x1, y1, x2, y2] ở scale H/4
-        
-        # Scale boxes về kích thước ảnh gốc
-        selected_boxes = selected_boxes * 4.0
+        # Lấy tọa độ Box đã giải mã
+        selected_boxes = decoded_boxes[0, topk_indices] # [x1, y1, x2, y2] ở scale ảnh gốc
         
         # 4. Đẩy qua Router
         points, point_labels, large_boxes, idx_p, idx_b = router.route(selected_boxes, density_map)
@@ -91,7 +94,15 @@ def main():
     # 1. Khởi tạo Models
     print("Đang tải CountYOLO...")
     countyolo = CountYOLO(use_clip=True).to(device)
-    # Tạm thời dùng weights random do chưa train xong toàn bộ bộ dữ liệu
+    
+    print("Đang nạp trọng số fine-tune...")
+    ckpt_path = "checkpoints/checkpoint_best.pth"
+    if os.path.exists(ckpt_path):
+        state_dict = torch.load(ckpt_path, map_location=device)
+        countyolo.load_state_dict(state_dict, strict=False)
+        print(f"  -> Đã nạp thành công {ckpt_path}")
+    else:
+        print(f"  -> Không tìm thấy {ckpt_path}, dùng weights mặc định.")
     
     print("Đang khởi tạo Router...")
     router = DualModeRouter(size_threshold=15)
