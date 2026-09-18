@@ -162,6 +162,8 @@ def train():
         model.train()
         pbar = tqdm(range(iterations), desc=f"Epoch {epoch+1}/{epochs}")
         epoch_loss = 0.0
+        ema_loss = None   # Exponential Moving Average de progress bar muot hon
+        ema_alpha = 0.98  # Momentum: 0.98 = smooth manh, 0.9 = nhanh hon
         
         for it in pbar:
             if args.sanity_check:
@@ -271,16 +273,29 @@ def train():
             if not args.sanity_check and wandb.run is not None:
                 wandb.log(log_stats)
                 
-            epoch_loss += total_loss.item()
+            # epoch_loss dung unscaled loss (log_stats['total_loss']) de nhat quan
+            # voi gia tri hien thi tren progress bar.
+            # KHONG dung total_loss.item() vi no da bi chia grad_accum_steps.
+            step_loss = log_stats['total_loss']
+            epoch_loss += step_loss
+            
+            # EMA loss de hien thi running average thay vi loss cua buoc hien tai
+            if ema_loss is None:
+                ema_loss = step_loss
+            else:
+                ema_loss = ema_alpha * ema_loss + (1 - ema_alpha) * step_loss
+            pbar.set_description(f"Epoch {epoch+1}/{epochs} | avg={ema_loss:.3f}")
                 
         # End epoch - Save Checkpoints
         if not args.sanity_check:
-            epoch_loss /= iterations
-            # Lưu model tốt nhất
+            epoch_loss /= iterations   # epoch_loss bay gio la trung binh UNSCALED loss
+            # Luu model tot nhat
             if epoch_loss < best_loss:
                 best_loss = epoch_loss
                 torch.save(model.state_dict(), "checkpoint_best.pth")
-                print(f"Lưu checkpoint tốt nhất tại epoch {epoch+1} (loss: {best_loss:.4f})")
+                print(f"[Epoch {epoch+1}] Luu checkpoint tot nhat (avg_loss={best_loss:.4f}, ema_loss={ema_loss:.4f})")
+            else:
+                print(f"[Epoch {epoch+1}] avg_loss={epoch_loss:.4f}, ema_loss={ema_loss:.4f} (best={best_loss:.4f})")
             
             # Lưu model mới nhất
             torch.save(model.state_dict(), "checkpoint_latest.pth")
