@@ -202,14 +202,10 @@ def train():
                 
                 # Decode boxes từ (l,t,r,b) sang tọa độ ảnh gốc tuyệt đối
                 pred_boxes_scaled = decode_fcos_boxes(pred_boxes, stride=4.0) # (B, N_preds, 4)
+                # Sau khi fix decode_fcos_boxes dùng exp(), x2 > x1 và y2 > y1 luôn đúng.
+                # Clamp về 0 vẫn giữ lại để an toàn khi box vượt biên ảnh.
+                pred_boxes_scaled = pred_boxes_scaled.clamp(min=0)
                 N_preds = pred_boxes_scaled.size(1)
-                
-                # Đảm bảo box hợp lệ cho hàm Loss (width, height >= 1)
-                x1 = pred_boxes_scaled[..., 0]
-                y1 = pred_boxes_scaled[..., 1]
-                x2 = torch.max(x1 + 1.0, pred_boxes_scaled[..., 2])
-                y2 = torch.max(y1 + 1.0, pred_boxes_scaled[..., 3])
-                pred_boxes_scaled_valid = torch.stack([x1, y1, x2, y2], dim=-1)
                 
                 # Xây dựng base cost dựa trên khoảng cách L1
                 matcher_cost_matrix = []
@@ -220,8 +216,8 @@ def train():
                         continue
                     
                     # Tính tâm của Bounding Box từ tọa độ ảnh gốc
-                    pred_cx = (pred_boxes_scaled_valid[b, :, 0] + pred_boxes_scaled_valid[b, :, 2]) / 2.0
-                    pred_cy = (pred_boxes_scaled_valid[b, :, 1] + pred_boxes_scaled_valid[b, :, 3]) / 2.0
+                    pred_cx = (pred_boxes_scaled[b, :, 0] + pred_boxes_scaled[b, :, 2]) / 2.0
+                    pred_cy = (pred_boxes_scaled[b, :, 1] + pred_boxes_scaled[b, :, 3]) / 2.0
                     pred_ctrs = torch.stack([pred_cx, pred_cy], dim=1) # (N_preds, 2)
                     
                     gt_pts_xy = points[b][:, [1, 0]]
@@ -230,7 +226,7 @@ def train():
                     cost_dist = torch.cdist(pred_ctrs.float(), gt_pts_xy.float(), p=1.0)
                     matcher_cost_matrix.append(cost_dist)
                 
-                cost_dens = matcher.compute_cost_dens(density_targets, pred_boxes_scaled_valid) # (B, N_preds, 1)
+                cost_dens = matcher.compute_cost_dens(density_targets, pred_boxes_scaled) # (B, N_preds, 1)
                 lambda_dens = matcher.get_lambda_dens(epoch)
                 
                 final_cost_list = []
@@ -242,7 +238,7 @@ def train():
                     final_cost_list.append(final_cost)
                     
                 # Tính Loss
-                loss_dict = base_criterion(pred_density, pred_cls, pred_boxes_scaled_valid, 
+                loss_dict = base_criterion(pred_density, pred_cls, pred_boxes_scaled,
                                            density_targets, points, boxes, final_cost_list)
                 
                 if use_uncertainty:
@@ -269,6 +265,7 @@ def train():
             log_stats = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()}
             pbar.set_postfix({'loss': f"{log_stats['total_loss']:.4f}", 
                               'den': f"{log_stats['loss_density']:.4f}",
+                              'cnt': f"{log_stats.get('loss_count', 0):.4f}",
                               'cls': f"{log_stats.get('loss_cls', 0):.4f}"})
             
             if not args.sanity_check and wandb.run is not None:

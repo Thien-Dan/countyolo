@@ -27,11 +27,12 @@ class CountYOLOLoss(nn.Module):
     2. Class Loss: Binary Cross Entropy cho dự đoán có/không có đối tượng.
     3. Box Loss: L1 Loss cho tọa độ hộp.
     """
-    def __init__(self, w_density=1.0, w_cls=1.0, w_box=1.0):
+    def __init__(self, w_density=1.0, w_cls=1.0, w_box=1.0, w_count=0.1):
         super().__init__()
         self.w_density = w_density
         self.w_cls = w_cls
         self.w_box = w_box
+        self.w_count = w_count  # Trọng số count regularization
 
     def forward(self, pred_density, pred_cls, pred_boxes, gt_density, gt_points, gt_boxes, matcher_cost_matrix):
         """
@@ -50,7 +51,16 @@ class CountYOLOLoss(nn.Module):
         # 1. DENSITY LOSS (Tính trên toàn bộ spatial dims)
         # Đảm bảo pred_density không âm
         pred_density = F.relu(pred_density)
-        loss_density = F.mse_loss(pred_density, gt_density) * self.w_density
+        loss_mse = F.mse_loss(pred_density, gt_density)
+        
+        # Count regularization: buộc tổng density map ≈ số objects thực tế.
+        # Ngăn model hội tụ vào trivial solution (predict toàn 0) để minimize MSE
+        # trên density map thưa thớt (>95% pixels = 0).
+        pred_count = pred_density.sum(dim=[2, 3])   # (B, 1)
+        gt_count   = gt_density.sum(dim=[2, 3])     # (B, 1)
+        loss_count = F.l1_loss(pred_count, gt_count)
+        
+        loss_density = (loss_mse + self.w_count * loss_count) * self.w_density
         
         loss_cls = torch.tensor(0.0, device=pred_density.device)
         loss_box = torch.tensor(0.0, device=pred_density.device)
@@ -93,31 +103,23 @@ class CountYOLOLoss(nn.Module):
             target_cls[row_ind, 0] = 1.0 
             loss_cls += F.binary_cross_entropy_with_logits(flat_cls[b], target_cls)
             
-            # Tính Box Loss (L1) - Sử dụng kích thước adaptive từ gt_boxes và định dạng [cx, cy, w, h]
-            if gt_boxes is not None and len(gt_boxes[b]) > 0:
-                g_boxes = gt_boxes[b].to(pred_density.device)
-                box_widths = g_boxes[:, 2] - g_boxes[:, 0]
-                box_heights = g_boxes[:, 3] - g_boxes[:, 1]
-                mean_w = box_widths.mean()
-                mean_h = box_heights.mean()
-            else:
-                mean_w = torch.tensor(20.0, device=pred_density.device)
-                mean_h = torch.tensor(20.0, device=pred_density.device)
-                
-            gt_pts = gt_points[b][col_ind].to(pred_density.device) # (N_matched, 2): [y_scaled, x_scaled]
-            cx = gt_pts[:, 1]                         # x_center
-            cy = gt_pts[:, 0]                         # y_center
-            half_w = mean_w / 2.0
-            half_h = mean_h / 2.0
-            # GT box định dạng [x1, y1, x2, y2] - khớp với định dạng pred_boxes sau decode
-            pseudo_gt_boxes = torch.stack([
-                cx - half_w,  # x1
-                cy - half_h,  # y1
-                cx + half_w,  # x2
-                cy + half_h   # y2
-            ], dim=1)
+            # Tính Box Loss (L1 trên center point):
+            # - Không dùng pseudo GT box từ exemplar mean size vì 3 exemplar boxes
+            #   không đại diện cho kích thước tất cả objects trong ảnh.
+            # - Thay vào đó, chỉ tính L1 loss trên tâm (cx, cy) của pred box so với
+            #   GT point annotation. Gradient này đúng hướng và không phụ thuộc vào
+            #   kích thước box giả.
+            gt_pts = gt_points[b][col_ind].to(pred_density.device)  # (N_matched, 2): [y_scaled, x_scaled]
+            gt_cx = gt_pts[:, 1]  # x_center
+            gt_cy = gt_pts[:, 0]  # y_center
+            gt_ctrs = torch.stack([gt_cx, gt_cy], dim=1)  # (N_matched, 2)
             
-            loss_box += F.l1_loss(matched_boxes, pseudo_gt_boxes)
+            # Tính tâm pred box từ [x1, y1, x2, y2]
+            pred_cx = (matched_boxes[:, 0] + matched_boxes[:, 2]) / 2.0
+            pred_cy = (matched_boxes[:, 1] + matched_boxes[:, 3]) / 2.0
+            pred_ctrs = torch.stack([pred_cx, pred_cy], dim=1)  # (N_matched, 2)
+            
+            loss_box += F.l1_loss(pred_ctrs, gt_ctrs)
             total_matched += 1
             
         if total_matched > 0:
@@ -126,7 +128,8 @@ class CountYOLOLoss(nn.Module):
             
         return {
             'loss_density': loss_density,
-            'loss_cls': loss_cls * self.w_cls,
-            'loss_box': loss_box * self.w_box,
-            'total_loss': loss_density + loss_cls * self.w_cls + loss_box * self.w_box
+            'loss_count':   loss_count,
+            'loss_cls':     loss_cls * self.w_cls,
+            'loss_box':     loss_box * self.w_box,
+            'total_loss':   loss_density + loss_cls * self.w_cls + loss_box * self.w_box
         }

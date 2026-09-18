@@ -6,6 +6,14 @@ from transformers import CLIPModel, CLIPProcessor
 # get_image_features() → 512-dim — CÙNG không gian với get_text_features()
 CLIP_PROJECTION_DIM = 512
 
+# CLIP ViT-B/32 image normalization constants (xac nhan tu CLIPProcessor)
+# do_normalize=True: pixel = (pixel - mean) / std
+# Input cua ExemplarEncoder la [0,1] tensor (tu TF.to_tensor / F.interpolate),
+# can normalize truoc khi truyen vao get_image_features().
+CLIP_IMG_MEAN = [0.48145466, 0.4578275,  0.40821073]
+CLIP_IMG_STD  = [0.26862954, 0.26130258, 0.27577711]
+
+
 class ExemplarEncoder(nn.Module):
     """
     Mã hóa ảnh exemplar (visual crops) bằng CLIP Image Encoder.
@@ -42,20 +50,27 @@ class ExemplarEncoder(nn.Module):
         """
         Args:
             crop_tensors: (B, N_ex, 3, H_crop, W_crop)
-                          Ảnh crop exemplar đã resize về kích thước CLIP (224×224)
+                          Crop exemplar [0,1] float tensor (output cua TF.to_tensor / F.interpolate)
         Returns:
             exemplar_feats: (B, N_ex, out_channels)
         """
         B, N_ex, C, H, W = crop_tensors.shape
 
-        # Flatten để xử lý song song
+        # Flatten de xu ly song song
         flat_crops = crop_tensors.view(B * N_ex, C, H, W)  # (B*N_ex, 3, H, W)
+
+        # Normalize theo CLIP mean/std truoc khi truyen vao ViT.
+        # TF.to_tensor() / F.interpolate cho ra [0,1]. CLIP yeu cau normalize:
+        #   pixel = (pixel - mean) / std
+        mean = torch.tensor(CLIP_IMG_MEAN, device=flat_crops.device).view(1, 3, 1, 1)
+        std  = torch.tensor(CLIP_IMG_STD,  device=flat_crops.device).view(1, 3, 1, 1)
+        flat_crops = (flat_crops - mean) / std
 
         self.clip.eval()
         with torch.no_grad():
             image_feats = self.clip.get_image_features(pixel_values=flat_crops)
             
-            # Xử lý các phiên bản transformers trả về object thay vì tensor
+            # Xu ly cac phien ban transformers tra ve object thay vi tensor
             if not isinstance(image_feats, torch.Tensor):
                 if hasattr(image_feats, 'image_embeds'):
                     image_feats = image_feats.image_embeds
