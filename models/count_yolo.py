@@ -70,8 +70,10 @@ class CountYOLO(nn.Module):
         """
         Mo bang layer3 + layer4 (deep features) voi lr nho hon (curriculum).
         Goi tu train.py sau epoch N (vd epoch 6).
+        Returns list of newly unfrozen parameters.
         """
-        self.backbone.unfreeze_deep()
+        return self.backbone.unfreeze_deep()
+
 
     def forward(self, images: torch.Tensor, text_feats=None, attr_feats=None,
                 texts=None, exemplar_crops=None, attr_texts=None) -> dict:

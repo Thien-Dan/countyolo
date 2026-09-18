@@ -169,12 +169,13 @@ def train():
         
         # Curriculum unfreeze: mo bang layer3+layer4 sau epoch N
         if epoch == unfreeze_epoch and fine_tune_cfg.get('freeze_backbone', False):
-            model.unfreeze_backbone_deep()
-            # Them param group moi voi lr nho hon
-            unfreeze_lr_scale = fine_tune_cfg.get('unfreeze_lr_scale', 0.1)
-            new_params = [p for p in model.backbone.parameters() if p.requires_grad]
-            optimizer.add_param_group({'params': new_params, 'lr': cfg['training']['lr'] * unfreeze_lr_scale})
-            print(f'[Epoch {epoch+1}] Curriculum: unfreeze backbone layer3+layer4 (lr x{unfreeze_lr_scale})')
+            new_params = model.unfreeze_backbone_deep()
+            if new_params:
+                # Them param group moi voi lr nho hon
+                unfreeze_lr_scale = fine_tune_cfg.get('unfreeze_lr_scale', 0.1)
+                optimizer.add_param_group({'params': new_params, 'lr': cfg['training']['lr'] * unfreeze_lr_scale})
+                print(f'[Epoch {epoch+1}] Curriculum: unfreeze backbone layer3+layer4 (lr x{unfreeze_lr_scale})')
+
         
         pbar = tqdm(range(iterations), desc=f"Epoch {epoch+1}/{epochs}")
         epoch_loss = 0.0

@@ -70,12 +70,18 @@ class ResNet50Backbone(nn.Module):
         return {'P3': P3, 'P4': P4, 'P5': P5}
 
     def freeze(self):
-        """Dong bang toan bo backbone (stem + layer1-4 + lateral convs)."""
-        for param in self.parameters():
-            param.requires_grad = False
+        """Dong bang cac layer pretrained (stem + layer1-4). Giu nguyen lateral convs de train tu epoch 0."""
+        for module in [self.stem, self.layer1, self.layer2, self.layer3, self.layer4]:
+            for param in module.parameters():
+                param.requires_grad = False
 
     def unfreeze_deep(self):
-        """Mo bang layer3 + layer4 + lateral P4/P5 voi lr nho (curriculum)."""
-        for module in [self.layer3, self.layer4, self.lat_P4, self.lat_P5]:
+        """Mo bang layer3 + layer4 voi lr nho (curriculum)."""
+        new_params = []
+        for module in [self.layer3, self.layer4]:
             for param in module.parameters():
-                param.requires_grad = True
+                if not param.requires_grad:
+                    param.requires_grad = True
+                    new_params.append(param)
+        return new_params
+
