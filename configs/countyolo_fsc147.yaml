@@ -23,10 +23,13 @@ matcher:
   warmup_epochs: 5
   
 loss:
-  use_uncertainty: true # Tự động cân bằng loss bằng thuật toán Kendall et al.
-  w_density: 1.0        # Trọng số khởi tạo (nếu không dùng uncertainty)
+  use_uncertainty: true
+  w_density: 1.0
   w_box: 1.0
   w_cls: 1.0
+  w_centerness: 0.5       # Trong so centerness loss
+  focal_alpha: 0.25       # Focal Loss alpha (balance pos/neg)
+  focal_gamma: 2.0        # Focal Loss gamma (focusing param)
 
 wandb:
   project: "CountYOLO-v4"
@@ -35,5 +38,7 @@ wandb:
 fine_tune:
   freeze_clip: true
   freeze_backbone: true
-  gradient_accumulation_steps: 4 # Phù hợp cho GPU 12GB VRAM để mô phỏng batch size lớn
-  use_amp: true # Sử dụng Mixed Precision (FP16)
+  gradient_accumulation_steps: 4
+  use_amp: true
+  unfreeze_epoch: 6       # Mo bang layer3+layer4 sau epoch nay (curriculum)
+  unfreeze_lr_scale: 0.1  # LR nho hon cho cac layer duoc mo bang

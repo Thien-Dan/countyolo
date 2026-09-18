@@ -120,9 +120,14 @@ def train():
                                    warmup_epochs=cfg['matcher']['warmup_epochs']).to(device)
     
     # Loss & Optimizer
-    base_criterion = CountYOLOLoss(w_density=cfg['loss']['w_density'], 
-                                   w_cls=cfg['loss']['w_cls'], 
-                                   w_box=cfg['loss']['w_box']).to(device)
+    base_criterion = CountYOLOLoss(
+        w_density    = cfg['loss']['w_density'],
+        w_cls        = cfg['loss']['w_cls'],
+        w_box        = cfg['loss']['w_box'],
+        w_centerness = cfg['loss'].get('w_centerness', 0.5),
+        focal_alpha  = cfg['loss'].get('focal_alpha', 0.25),
+        focal_gamma  = cfg['loss'].get('focal_gamma', 2.0),
+    ).to(device)
                                    
     use_uncertainty = cfg['loss'].get('use_uncertainty', False)
     # Lọc ra các parameter không bị đóng băng để huấn luyện
@@ -138,6 +143,7 @@ def train():
     # Sanity Check setup
     epochs = 1 if args.sanity_check else cfg['training']['epochs']
     iterations = 200 if args.sanity_check else len(dataloader)
+    unfreeze_epoch = fine_tune_cfg.get('unfreeze_epoch', 999)  # default: never unfreeze
     
     # WandB setup
     if not args.sanity_check:
@@ -160,6 +166,16 @@ def train():
         
     for epoch in range(epochs):
         model.train()
+        
+        # Curriculum unfreeze: mo bang layer3+layer4 sau epoch N
+        if epoch == unfreeze_epoch and fine_tune_cfg.get('freeze_backbone', False):
+            model.unfreeze_backbone_deep()
+            # Them param group moi voi lr nho hon
+            unfreeze_lr_scale = fine_tune_cfg.get('unfreeze_lr_scale', 0.1)
+            new_params = [p for p in model.backbone.parameters() if p.requires_grad]
+            optimizer.add_param_group({'params': new_params, 'lr': cfg['training']['lr'] * unfreeze_lr_scale})
+            print(f'[Epoch {epoch+1}] Curriculum: unfreeze backbone layer3+layer4 (lr x{unfreeze_lr_scale})')
+        
         pbar = tqdm(range(iterations), desc=f"Epoch {epoch+1}/{epochs}")
         epoch_loss = 0.0
         ema_loss = None   # Exponential Moving Average de progress bar muot hon
@@ -196,20 +212,22 @@ def train():
             with torch.cuda.amp.autocast(enabled=use_amp):
                 # Truyền exemplar_crops vào model: CountYOLO sẽ tự gọi ExemplarEncoder
                 outputs = model(images, texts=texts, exemplar_crops=exemplar_crops)
-                pred_density = outputs['density_map']
-                pred_cls = outputs['cls_scores']
-                pred_boxes = outputs['box_preds']
+                pred_density = outputs['density_map']          # (B, 1, H, W)
+                cls_dict     = outputs['cls_scores']            # {'P3', 'P4'}
+                box_dict     = outputs['box_preds']             # {'P3', 'P4'}
+                ctr_dict     = outputs['centerness']            # {'P3', 'P4'}
                 
                 from utils.box_utils import decode_fcos_boxes
                 
-                # Decode boxes từ (l,t,r,b) sang tọa độ ảnh gốc tuyệt đối
-                pred_boxes_scaled = decode_fcos_boxes(pred_boxes, stride=4.0) # (B, N_preds, 4)
-                # Sau khi fix decode_fcos_boxes dùng exp(), x2 > x1 và y2 > y1 luôn đúng.
-                # Clamp về 0 vẫn giữ lại để an toàn khi box vượt biên ảnh.
-                pred_boxes_scaled = pred_boxes_scaled.clamp(min=0)
+                # Decode boxes tu P3 (stride=8) va P4 (stride=16)
+                boxes_P3 = decode_fcos_boxes(box_dict['P3'], stride=8.0).clamp(min=0)   # (B, N3, 4)
+                boxes_P4 = decode_fcos_boxes(box_dict['P4'], stride=16.0).clamp(min=0)  # (B, N4, 4)
+                
+                # Merge P3 + P4 theo dim N_preds
+                pred_boxes_scaled = torch.cat([boxes_P3, boxes_P4], dim=1)  # (B, N3+N4, 4)
                 N_preds = pred_boxes_scaled.size(1)
                 
-                # Xây dựng base cost dựa trên khoảng cách L1
+                # Xay dung base cost dua tren khoang cach L1
                 matcher_cost_matrix = []
                 for b in range(B):
                     N_gt = len(points[b])
@@ -217,14 +235,13 @@ def train():
                         matcher_cost_matrix.append(torch.zeros((N_preds, 0), device=device))
                         continue
                     
-                    # Tính tâm của Bounding Box từ tọa độ ảnh gốc
+                    # Tinh tam cua Bounding Box tu toa do anh goc
                     pred_cx = (pred_boxes_scaled[b, :, 0] + pred_boxes_scaled[b, :, 2]) / 2.0
                     pred_cy = (pred_boxes_scaled[b, :, 1] + pred_boxes_scaled[b, :, 3]) / 2.0
-                    pred_ctrs = torch.stack([pred_cx, pred_cy], dim=1) # (N_preds, 2)
+                    pred_ctrs = torch.stack([pred_cx, pred_cy], dim=1)  # (N_preds, 2)
                     
                     gt_pts_xy = points[b][:, [1, 0]]
                     
-                    # Convert sang float32 vì torch.cdist CUDA không hỗ trợ FP16 (Half)
                     cost_dist = torch.cdist(pred_ctrs.float(), gt_pts_xy.float(), p=1.0)
                     matcher_cost_matrix.append(cost_dist)
                 
@@ -239,9 +256,11 @@ def train():
                         final_cost = matcher_cost_matrix[b]
                     final_cost_list.append(final_cost)
                     
-                # Tính Loss
-                loss_dict = base_criterion(pred_density, pred_cls, pred_boxes_scaled,
-                                           density_targets, points, boxes, final_cost_list)
+                # Tinh Loss (truyen multi-scale dicts thay vi tensor phang)
+                loss_dict = base_criterion(
+                    pred_density, cls_dict, box_dict, ctr_dict,
+                    density_targets, points, boxes, final_cost_list
+                )
                 
                 if use_uncertainty:
                     losses_to_balance = [loss_dict['loss_density'], loss_dict['loss_cls'], loss_dict['loss_box']]
@@ -265,10 +284,13 @@ def train():
             
             # Logging
             log_stats = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()}
-            pbar.set_postfix({'loss': f"{log_stats['total_loss']:.4f}", 
-                              'den': f"{log_stats['loss_density']:.4f}",
-                              'cnt': f"{log_stats.get('loss_count', 0):.4f}",
-                              'cls': f"{log_stats.get('loss_cls', 0):.4f}"})
+            pbar.set_postfix({
+                'loss': f"{log_stats['total_loss']:.4f}",
+                'den':  f"{log_stats['loss_density']:.4f}",
+                'cnt':  f"{log_stats.get('loss_count', 0):.4f}",
+                'cls':  f"{log_stats.get('loss_cls', 0):.4f}",
+                'ctr':  f"{log_stats.get('loss_centerness', 0):.4f}",
+            })
             
             if not args.sanity_check and wandb.run is not None:
                 wandb.log(log_stats)
