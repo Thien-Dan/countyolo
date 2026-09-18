@@ -8,6 +8,7 @@ wandb
 pillow
 opencv-python
 numpy
+ultralytics
 # SAM 2.1 (cài qua git):
 # pip install git+https://github.com/facebookresearch/sam2.git
 # hydra-core
