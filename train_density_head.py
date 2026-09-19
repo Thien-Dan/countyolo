@@ -12,6 +12,9 @@ import cv2
 CHECKPOINT_DIR: str = "checkpoints"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
+# Stride của P3 (stride 8) -> density map size = 640/8 = 80
+FEATURE_STRIDE: int = 8
+
 from models.density_yolo import DensityYOLOWorld
 
 def generate_density_map(image_shape, points, sigma=4):
@@ -63,15 +66,19 @@ class FSC147Dataset(Dataset):
         image = image.resize((640, 640))
         img_tensor = TF.to_tensor(image) # (3, 640, 640)
         
-        # Đọc points và tính scale
+        # Đọc points và tính scale về 640x640
         gt_points = self.annos.get(img_name, {}).get("points", [])
         scaled_points = []
         for p in gt_points:
             scaled_points.append([p[0] * 640 / W, p[1] * 640 / H])
             
-        # Target Density Map: P4 stride là 16, nên map size = 640/16 = 40
-        density_map = generate_density_map((40, 40), [[p[0]/16, p[1]/16] for p in scaled_points])
-        density_tensor = torch.from_numpy(density_map).unsqueeze(0) # (1, 40, 40)
+        # Target Density Map: P3 stride là 8 -> map size = 640/8 = 80
+        feat_size = 640 // FEATURE_STRIDE  # 80
+        density_map = generate_density_map(
+            (feat_size, feat_size),
+            [[p[0] / FEATURE_STRIDE, p[1] / FEATURE_STRIDE] for p in scaled_points]
+        )
+        density_tensor = torch.from_numpy(density_map).unsqueeze(0)  # (1, 80, 80)
         
         return img_tensor, density_tensor
 

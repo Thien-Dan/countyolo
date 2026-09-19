@@ -44,18 +44,15 @@ class DensityYOLOWorld(nn.Module):
         self.features = None
         self._register_hook()
         
-        # YOLOv8s neck features thường có channel = 256 ở scale P4
-        # Do ta bắt ở input của Detect head nên ta cần biết kênh.
-        # Ở đây ta giả định chọn feature ở giữa (P4) có in_channels=256
-        self.density_head = DensityHead(in_channels=256)
+        # P3 (stride 8, 80x80) cho Density Head -- chi tiết không gian tốt hơn P4
+        self.density_head = DensityHead(in_channels=128)
 
     def _register_hook(self):
         def hook_fn(module, input):
             # input là một tuple, input[0] thường là list các feature maps [P3, P4, P5]
             if isinstance(input[0], (list, tuple)) and len(input[0]) >= 3:
-                # P3 (stride 8), P4 (stride 16), P5 (stride 32)
-                # Dùng P4 (stride 16) làm feature cho Density Map
-                self.features = input[0][1] 
+                # P3 (stride 8, 80x80) cho Density Head -- chi tiết không gian tốt hơn P4
+                self.features = input[0][0]  # P3
             else:
                 self.features = input[0]
 

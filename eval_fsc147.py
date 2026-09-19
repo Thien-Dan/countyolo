@@ -45,6 +45,41 @@ def load_density_head(device: torch.device, checkpoint_path: str) -> Optional[ob
         return None
 
 
+def predict_with_density_count(
+    wrapper,
+    img_path: str,
+    class_name: str,
+    device: torch.device,
+) -> float:
+    """
+    Dự đoán số lượng vật thể bằng cách lấy tổng (sum) của Density Map.
+    Đây là nguyên lý cốt lõi của Density Estimation Counting.
+    Không cần NMS, không cần Bounding Box.
+
+    Args:
+        wrapper: Model DensityYOLOWorld đã tải checkpoint
+        img_path: Đường dẫn ảnh đầu vào
+        class_name: Tên class (dùng để set_classes cho YOLO)
+        device: Thiết bị tính toán
+
+    Returns:
+        Số lượng vật thể dự đoán dưới dạng float
+    """
+    from PIL import Image
+    import torchvision.transforms.functional as TF
+
+    image = Image.open(img_path).convert("RGB").resize((640, 640))
+    img_tensor: torch.Tensor = TF.to_tensor(image).unsqueeze(0).to(device)  # (1,3,640,640)
+
+    wrapper.yolo.set_classes([class_name])
+    with torch.no_grad():
+        _, density_map = wrapper(img_tensor)  # density_map: (1, 1, 40, 40)
+
+    # Tổng của Density Map = số lượng vật thể ước lượng
+    pred_count: float = density_map.sum().item()
+    return pred_count
+
+
 def predict_with_density_nms(
     wrapper,
     img_path: str,
@@ -107,6 +142,7 @@ def eval_fsc147(
     conf: float = 0.1,
     iou: float = 0.7,
     use_density_nms: bool = False,
+    use_density_count: bool = False,
     checkpoint: str = "density_head_best.pth",
 ) -> None:
     """
@@ -117,6 +153,7 @@ def eval_fsc147(
         conf: Confidence threshold cho chế độ Zero-Shot
         iou: IoU threshold cho NMS ở chế độ Zero-Shot
         use_density_nms: Nếu True, dùng Density-Guided Soft-NMS thay vì NMS mặc định
+        use_density_count: Nếu True, dùng SUM(Density Map) để đếm trực tiếp (không cần NMS)
         checkpoint: Tên file checkpoint (bên trong thư mục checkpoints/)
     """
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -155,8 +192,32 @@ def eval_fsc147(
     total_abs_error: float = 0.0
     valid_images: int = 0
 
+    # ---- Chế độ 0: Density Sum Count (dùng tổng Density Map để đếm trực tiếp) ----
+    if use_density_count:
+        ckpt_path = os.path.join(CHECKPOINT_DIR, checkpoint)
+        if not os.path.exists(ckpt_path):
+            print(f"[LỖI] Không tìm thấy checkpoint: {ckpt_path}")
+            return
+
+        print(f"\nChế độ: Density Sum Count (SUM của Heatmap, checkpoint: {ckpt_path})")
+        wrapper = load_density_head(device, ckpt_path)
+        if wrapper is None:
+            return
+
+        for img_name in tqdm(test_images):
+            img_path = os.path.join(img_dir, img_name)
+            if not os.path.exists(img_path):
+                continue
+
+            class_name = img_to_class.get(img_name, "object")
+            gt_count: int = len(annos.get(img_name, {}).get("points", []))
+            pred_count_f: float = predict_with_density_count(wrapper, img_path, class_name, device)
+
+            total_abs_error += abs(pred_count_f - gt_count)
+            valid_images += 1
+
     # ---- Chế độ 1: Density-Guided NMS (dùng Density Head đã train) ----
-    if use_density_nms:
+    elif use_density_nms:
         ckpt_path = os.path.join(CHECKPOINT_DIR, checkpoint)
         if not os.path.exists(ckpt_path):
             print(f"[LỖI] Không tìm thấy checkpoint: {ckpt_path}")
@@ -203,7 +264,12 @@ def eval_fsc147(
     # ---- In kết quả ----
     if valid_images > 0:
         mae: float = total_abs_error / valid_images
-        mode_str = "Density-Guided NMS" if use_density_nms else "Zero-Shot"
+        if use_density_count:
+            mode_str = "Density Sum Count"
+        elif use_density_nms:
+            mode_str = "Density-Guided NMS"
+        else:
+            mode_str = "Zero-Shot"
         print(f"\n=== KẾT QUẢ BENCHMARK FSC-147 [{mode_str}] ===")
         print(f"  Tổng số ảnh đánh giá : {valid_images}")
         print(f"  Mean Absolute Error (MAE): {mae:.2f}")
@@ -216,7 +282,9 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=None, help="Giới hạn số ảnh đánh giá")
     parser.add_argument("--conf", type=float, default=0.1, help="Confidence threshold (Zero-Shot mode)")
     parser.add_argument("--iou", type=float, default=0.7, help="NMS IoU threshold (Zero-Shot mode)")
-    parser.add_argument("--density-nms", action="store_true", help="Dùng Density-Guided Soft-NMS với checkpoint đã train")
+    parser.add_argument("--density-nms", action="store_true", help="Dùng Density-Guided Soft-NMS")
+    parser.add_argument("--density-count", action="store_true",
+                        help="Dùng SUM(Density Map) để đếm trực tiếp (không NMS)")
     parser.add_argument("--checkpoint", type=str, default="density_head_best.pth",
                         help="Tên file checkpoint trong thư mục checkpoints/")
     args = parser.parse_args()
@@ -226,5 +294,6 @@ if __name__ == "__main__":
         conf=args.conf,
         iou=args.iou,
         use_density_nms=args.density_nms,
+        use_density_count=args.density_count,
         checkpoint=args.checkpoint,
     )
