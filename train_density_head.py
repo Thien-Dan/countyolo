@@ -9,6 +9,9 @@ import torchvision.transforms.functional as TF
 import numpy as np
 import cv2
 
+CHECKPOINT_DIR: str = "checkpoints"
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
 from models.density_yolo import DensityYOLOWorld
 
 def generate_density_map(image_shape, points, sigma=4):
@@ -121,7 +124,9 @@ def train():
         print(f"Epoch [{epoch+1}/{epochs}] - Loss: {epoch_loss / len(dataloader):.6f}")
 
     print("Huấn luyện hoàn tất. Lưu trọng số Density Head...")
-    torch.save(model.density_head.state_dict(), "density_head_best.pth")
+    save_path = os.path.join(CHECKPOINT_DIR, "density_head_best.pth")
+    torch.save(model.density_head.state_dict(), save_path)
+    print(f"Đã lưu checkpoint tại: {save_path}")
 
 if __name__ == "__main__":
     train()
