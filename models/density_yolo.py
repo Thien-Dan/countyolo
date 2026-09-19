@@ -20,8 +20,8 @@ class SobelEdgeExtractor(nn.Module):
         x_gray = x.mean(dim=1, keepdim=True)
         # Pad để giữ nguyên kích thước
         x_pad = F.pad(x_gray, (1, 1, 1, 1), mode='reflect')
-        gx = F.conv2d(x_pad, self.sobel_x)
-        gy = F.conv2d(x_pad, self.sobel_y)
+        gx = F.conv2d(x_pad, self.sobel_x.to(dtype=x.dtype))
+        gy = F.conv2d(x_pad, self.sobel_y.to(dtype=x.dtype))
         # Tính độ lớn Gradient (Edge Magnitude)
         edges = torch.sqrt(gx ** 2 + gy ** 2 + 1e-6)
         
