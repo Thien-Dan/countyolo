@@ -1,4 +1,6 @@
 # CountYOLO v4 Configuration for FSC-147 Dataset
+# LƯU Ý: file này là thiết kế cho lộ trình v4 đầy đủ, CHƯA được script nào đọc.
+# Tham số train thực tế nằm ở argparse của train_density_head.py (xem PROJECT_OVERVIEW.md mục 5).
 
 dataset:
   name: "FSC-147"

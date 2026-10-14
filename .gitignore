@@ -48,3 +48,12 @@ env/
 
 # --- WandB ---
 wandb/
+
+# --- Kaggle API tokens (bí mật, không bao giờ commit) ---
+kaggle/
+kaggle_run/
+kaggle_countvid_run/
+kaggle_bench_run/
+
+# --- Checkpoint tốt nhất (head ~2.4MB, YOLO-World + DINOv2-small, test MAE 18.90) được giữ lại ---
+!checkpoints/density_head_best_vit_seed3_ep19_valmae21.44.pth

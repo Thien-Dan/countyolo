@@ -1,11 +1,13 @@
 import sys
 import os
-import json
+import csv
 import torch
-import numpy as np
 from tqdm import tqdm
 import argparse
-from typing import Dict, List, Optional
+from typing import Optional
+
+import numpy as np
+from PIL import Image
 
 try:
     from ultralytics import YOLOWorld
@@ -13,287 +15,214 @@ except ImportError:
     print("Vui lòng cài đặt ultralytics: pip install ultralytics")
     sys.exit(1)
 
+from datasets.fsc147_dataset import FSC147Dataset
+from utils.scale_zoom import canonical_scale_count, weighted_log_size
+
 CHECKPOINT_DIR: str = "checkpoints"
+FEATURE_STRIDE: float = 8.0  # P3
 
 
-def load_density_head(device: torch.device, checkpoint_path: str) -> Optional[object]:
-    """
-    Tải Density Head đã được fine-tune từ file checkpoint.
-
-    Args:
-        device: Thiết bị chạy mô hình (cuda/cpu)
-        checkpoint_path: Đường dẫn file .pth
-
-    Returns:
-        DensityYOLOWorld wrapper đã tải trọng số, hoặc None nếu có lỗi
-    """
+def load_density_model(device: torch.device, checkpoint_path: str) -> Optional[object]:
+    """Tải DensityYOLOWorld + trọng số Density Head đã train."""
     try:
         from models.density_yolo import DensityYOLOWorld
         wrapper = DensityYOLOWorld("yolov8s-world.pt")
-        # Load checkpoint trước khi move sang device
-        wrapper.density_head.load_state_dict(
-            torch.load(checkpoint_path, map_location=device)
-        )
-        # Move toàn bộ model (cả YOLO backbone + CLIP text encoder + Density Head) sang cùng device
-        wrapper.yolo.to(device)
-        wrapper.density_head.to(device)
+        ckpt = wrapper.load_head(checkpoint_path, map_location="cpu")
+        wrapper.to(device)
         wrapper.eval_mode()
-        print(f"  Đã tải Density Head từ: {checkpoint_path}")
+        print(f"  Đã tải Density Head từ: {checkpoint_path} (epoch {ckpt.get('epoch')}, "
+              f"val MAE {ckpt.get('val_mae')})")
         return wrapper
     except Exception as e:
         print(f"  [LỖI] Không tải được Density Head: {e}")
         return None
 
 
-def predict_with_density_count(
-    wrapper,
-    img_path: str,
-    class_name: str,
-    device: torch.device,
-) -> float:
+def raw_detections(dets: torch.Tensor, raw_conf: float, max_det: int = 3000):
     """
-    Dự đoán số lượng vật thể bằng cách lấy tổng (sum) của Density Map.
-    Đây là nguyên lý cốt lõi của Density Estimation Counting.
-    Không cần NMS, không cần Bounding Box.
-
-    Args:
-        wrapper: Model DensityYOLOWorld đã tải checkpoint
-        img_path: Đường dẫn ảnh đầu vào
-        class_name: Tên class (dùng để set_classes cho YOLO)
-        device: Thiết bị tính toán
-
-    Returns:
-        Số lượng vật thể dự đoán dưới dạng float
+    dets: (1, 4 + 1, N) đầu ra đã decode của YOLO-World (xywh, cùng hệ tọa độ ảnh 640x640 đưa vào model).
+    Trả về boxes xyxy (M, 4) và scores (M,) trước NMS.
     """
-    from PIL import Image
-    import torchvision.transforms.functional as TF
-
-    image = Image.open(img_path).convert("RGB").resize((640, 640))
-    img_tensor: torch.Tensor = TF.to_tensor(image).unsqueeze(0).to(device)  # (1,3,640,640)
-
-    wrapper.yolo.set_classes([class_name])
-    with torch.no_grad():
-        _, density_map = wrapper(img_tensor)  # density_map: (1, 1, 40, 40)
-
-    # Tổng của Density Map = số lượng vật thể ước lượng
-    pred_count: float = density_map.sum().item()
-    return pred_count
-
-
-def predict_with_density_nms(
-    wrapper,
-    img_path: str,
-    class_name: str,
-    device: torch.device,
-    raw_conf: float = 0.01,
-    score_threshold: float = 0.01,
-) -> int:
-    """
-    Chạy inference với Density-Guided Soft-NMS.
-
-    Args:
-        wrapper: Model DensityYOLOWorld đã tải checkpoint
-        img_path: Đường dẫn ảnh đầu vào
-        class_name: Tên class (dùng làm text prompt cho YOLO-World)
-        device: Thiết bị tính toán
-        raw_conf: Ngưỡng confidence thấp (lấy RAW detections trước khi custom NMS)
-        score_threshold: Ngưỡng score tối thiểu trong Soft-NMS
-
-    Returns:
-        Số lượng vật thể dự đoán (int)
-    """
-    from utils.custom_nms import density_guided_soft_nms
-    from PIL import Image
-    import torchvision.transforms.functional as TF
-
-    # 1. Chuẩn bị tensor ảnh resize về 640x640
-    image = Image.open(img_path).convert("RGB").resize((640, 640))
-    img_tensor: torch.Tensor = TF.to_tensor(image).unsqueeze(0).to(device)  # (1,3,640,640)
-
-    # 2. Đặt text prompt -> set_classes sẽ dùng CLIP text encoder (phải cùng device)
-    wrapper.yolo.set_classes([class_name])
-    with torch.no_grad():
-        # Lấy raw boxes với conf cực thấp + iou=0.99 để bypass NMS của YOLO
-        raw_results = wrapper.yolo.predict(
-            img_path, conf=raw_conf, iou=0.99, max_det=3000,
-            device=device, verbose=False
-        )
-        # Forward qua wrapper để kích hoạt hook -> lấy density_map
-        _, density_map = wrapper(img_tensor)  # density_map: (1, 1, 40, 40)
-
-    # Boxes và scores đã ở đúng device vì predict được chỉ định device=device
-    boxes_xyxy: torch.Tensor = raw_results[0].boxes.xyxy  # (N, 4)
-    scores: torch.Tensor = raw_results[0].boxes.conf       # (N,)
-
-    if boxes_xyxy.numel() == 0:
-        return 0
-
-    # 3. Chạy Density-Guided Soft-NMS
-    kept_indices = density_guided_soft_nms(
-        boxes_xyxy, scores, density_map,
-        stride=16.0,
-        score_threshold=score_threshold,
-    )
-    return len(kept_indices)
+    d = dets[0].float()
+    xywh, scores = d[:4].T, d[4]
+    keep = scores >= raw_conf
+    xywh, scores = xywh[keep], scores[keep]
+    if scores.numel() > max_det:
+        scores, idx = scores.topk(max_det)
+        xywh = xywh[idx]
+    boxes = torch.cat([xywh[:, :2] - xywh[:, 2:] / 2, xywh[:, :2] + xywh[:, 2:] / 2], dim=1)
+    return boxes, scores
 
 
 def eval_fsc147(
+    split: str = "test",
     limit: Optional[int] = None,
     conf: float = 0.1,
     iou: float = 0.7,
-    use_density_nms: bool = False,
-    use_density_count: bool = False,
+    mode: str = "zero-shot",
     checkpoint: str = "density_head_best.pth",
+    raw_conf: float = 0.05,
+    score_threshold: float = 0.1,
+    data_dir: str = "data/FSC147",
+    exemplars: str = "self",
+    zoom: float = 0.0,
+    zoom_max: int = 6,
+    dump: Optional[str] = None,
 ) -> None:
     """
-    Đánh giá hiệu năng trên tập test của FSC-147.
+    Đánh giá đếm trên FSC-147.
 
-    Args:
-        limit: Số ảnh tối đa cần đánh giá (None = toàn bộ)
-        conf: Confidence threshold cho chế độ Zero-Shot
-        iou: IoU threshold cho NMS ở chế độ Zero-Shot
-        use_density_nms: Nếu True, dùng Density-Guided Soft-NMS thay vì NMS mặc định
-        use_density_count: Nếu True, dùng SUM(Density Map) để đếm trực tiếp (không cần NMS)
-        checkpoint: Tên file checkpoint (bên trong thư mục checkpoints/)
+    mode:
+        zero-shot     : YOLO-World + NMS mặc định (baseline, ảnh gốc qua letterbox của Ultralytics)
+        density-count : SUM(density map)
+        density-nms   : Density-Guided Soft-NMS trên box thô của cùng một lần forward
+        soft-nms      : Soft-NMS thường trên cùng box thô (baseline ablation cho density-nms)
+
+    exemplars (Self-Exemplar): self = đỉnh density thô (zero-shot), gt = tâm 3 exemplar box của FSC-147 (few-shot)
+    zoom: kích thước vật chuẩn (px) cho Canonical-Scale Zoom ở density-count, 0 = tắt (cần Scale Head)
     """
-    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Sử dụng thiết bị: {device}")
 
-    data_dir: str = "data/FSC147"
-    img_dir: str = os.path.join(data_dir, "images_384_VarV2")
-    split_path: str = os.path.join(data_dir, "Train_Test_Val_FSC_147.json")
-    class_path: str = os.path.join(data_dir, "ImageClasses_FSC147.txt")
-    anno_path: str = os.path.join(data_dir, "annotation_FSC147_384.json")
+    dataset = FSC147Dataset(data_dir, split=split)
+    n_images = min(limit, len(dataset)) if limit else len(dataset)
+    print(f"Chế độ: {mode} | split={split} | {n_images} ảnh")
 
-    if not all(os.path.exists(p) for p in [split_path, class_path, anno_path, img_dir]):
-        print("Không tìm thấy đủ file dữ liệu FSC-147.")
-        return
-
-    # Load dữ liệu metadata
-    with open(split_path, 'r') as f:
-        test_images: List[str] = json.load(f).get("test", [])
-
-    if limit:
-        test_images = test_images[:limit]
-        print(f"Chỉ chạy đánh giá trên {limit} ảnh đầu tiên.")
-    else:
-        print(f"Chạy đánh giá trên toàn bộ {len(test_images)} ảnh tập Test.")
-
-    img_to_class: Dict[str, str] = {}
-    with open(class_path, 'r') as f:
-        for line in f:
-            parts = line.strip().split('\t')
-            if len(parts) >= 2:
-                img_to_class[parts[0]] = parts[1]
-
-    with open(anno_path, 'r') as f:
-        annos: Dict = json.load(f)
-
-    total_abs_error: float = 0.0
-    valid_images: int = 0
-
-    # ---- Chế độ 0: Density Sum Count (dùng tổng Density Map để đếm trực tiếp) ----
-    if use_density_count:
-        ckpt_path = os.path.join(CHECKPOINT_DIR, checkpoint)
-        if not os.path.exists(ckpt_path):
-            print(f"[LỖI] Không tìm thấy checkpoint: {ckpt_path}")
-            return
-
-        print(f"\nChế độ: Density Sum Count (SUM của Heatmap, checkpoint: {ckpt_path})")
-        wrapper = load_density_head(device, ckpt_path)
-        if wrapper is None:
-            return
-
-        for img_name in tqdm(test_images):
-            img_path = os.path.join(img_dir, img_name)
-            if not os.path.exists(img_path):
-                continue
-
-            class_name = img_to_class.get(img_name, "object")
-            gt_count: int = len(annos.get(img_name, {}).get("points", []))
-            pred_count_f: float = predict_with_density_count(wrapper, img_path, class_name, device)
-
-            total_abs_error += abs(pred_count_f - gt_count)
-            valid_images += 1
-
-    # ---- Chế độ 1: Density-Guided NMS (dùng Density Head đã train) ----
-    elif use_density_nms:
-        ckpt_path = os.path.join(CHECKPOINT_DIR, checkpoint)
-        if not os.path.exists(ckpt_path):
-            print(f"[LỖI] Không tìm thấy checkpoint: {ckpt_path}")
-            return
-
-        print(f"\nChế độ: Density-Guided Soft-NMS (checkpoint: {ckpt_path})")
-        wrapper = load_density_head(device, ckpt_path)
-        if wrapper is None:
-            return
-
-        for img_name in tqdm(test_images):
-            img_path = os.path.join(img_dir, img_name)
-            if not os.path.exists(img_path):
-                continue
-
-            class_name = img_to_class.get(img_name, "object")
-            gt_count: int = len(annos.get(img_name, {}).get("points", []))
-            pred_count: int = predict_with_density_nms(wrapper, img_path, class_name, device)
-
-            total_abs_error += abs(pred_count - gt_count)
-            valid_images += 1
-
-    # ---- Chế độ 2: Zero-Shot YOLO-World (NMS mặc định của Ultralytics) ----
-    else:
-        print("\nChế độ: Zero-Shot YOLO-World (NMS mặc định)")
+    if mode == "zero-shot":
         yolo_model = YOLOWorld("yolov8s-world.pt")
         yolo_model.to(device)
-
-        for img_name in tqdm(test_images):
-            img_path = os.path.join(img_dir, img_name)
-            if not os.path.exists(img_path):
-                continue
-
-            class_name = img_to_class.get(img_name, "object")
-            gt_count = len(annos.get(img_name, {}).get("points", []))
-
-            yolo_model.set_classes([class_name])
-            results = yolo_model.predict(img_path, conf=conf, iou=iou, verbose=False)
-            pred_count = len(results[0].boxes)
-
-            total_abs_error += abs(pred_count - gt_count)
-            valid_images += 1
-
-    # ---- In kết quả ----
-    if valid_images > 0:
-        mae: float = total_abs_error / valid_images
-        if use_density_count:
-            mode_str = "Density Sum Count"
-        elif use_density_nms:
-            mode_str = "Density-Guided NMS"
-        else:
-            mode_str = "Zero-Shot"
-        print(f"\n=== KẾT QUẢ BENCHMARK FSC-147 [{mode_str}] ===")
-        print(f"  Tổng số ảnh đánh giá : {valid_images}")
-        print(f"  Mean Absolute Error (MAE): {mae:.2f}")
     else:
-        print("Không có ảnh nào được đánh giá thành công.")
+        from utils.custom_nms import density_guided_soft_nms
+        ckpt_path = checkpoint if os.path.exists(checkpoint) else os.path.join(CHECKPOINT_DIR, checkpoint)
+        wrapper = load_density_model(device, ckpt_path)
+        if wrapper is None:
+            return
+        if zoom and wrapper.scale_head is None:
+            print("  [CẢNH BÁO] Checkpoint không có Scale Head -> tắt Canonical-Scale Zoom")
+            zoom = 0.0
+        if zoom and exemplars != "self":
+            print("  [CẢNH BÁO] Canonical-Scale Zoom chỉ hỗ trợ exemplars=self -> tắt zoom")
+            zoom = 0.0
+
+    abs_err, sq_err, coarse_err = 0.0, 0.0, 0.0
+    errors, gt_sizes, est_sizes, n_zoomed = [], [], [], 0
+    rows = []  # --dump: kết quả từng ảnh
+    for i in tqdm(range(n_images)):
+        sample = dataset[i]
+        gt_count = sample['count']
+        class_name = sample['class_name']
+
+        if mode == "zero-shot":
+            yolo_model.set_classes([class_name])
+            img_path = os.path.join(dataset.img_dir, sample['image_name'])
+            results = yolo_model.predict(img_path, conf=conf, iou=iou, max_det=3000, verbose=False)
+            pred_count = float(len(results[0].boxes))
+        else:
+            img = sample['image'].unsqueeze(0).to(device)
+            ex_points = None
+            if exemplars == "gt":
+                b = sample['boxes']
+                ex_points = [(b[:, :2] + b[:, 2:]) / 2]
+            with torch.no_grad():
+                dets, density_map, aux = wrapper(img, [class_name], exemplar_points=ex_points, return_aux=True)
+            coarse_err += abs(aux['coarse'].sum().item() - gt_count)
+            gt_sizes.append(sample['size_map'][0, 0, 0].item())
+            if aux['log_size'] is not None:
+                est_sizes.append(weighted_log_size(aux['log_size'][0, 0].float(), density_map[0, 0].float(),
+                                                   fallback=float('nan')))
+            if mode == "density-count":
+                pred_count = density_map.sum().item()
+                if zoom:
+                    image = Image.open(os.path.join(dataset.img_dir, sample['image_name'])).convert("RGB")
+                    with torch.no_grad():
+                        pred_count, info = canonical_scale_count(wrapper, image, class_name, device,
+                                                                 target=zoom, max_zoom=zoom_max)
+                    n_zoomed += info["zoomed"] > 0
+            else:
+                boxes, scores = raw_detections(dets, raw_conf)
+                kept = density_guided_soft_nms(
+                    boxes, scores, density_map if mode == "density-nms" else None,
+                    stride=FEATURE_STRIDE, score_threshold=score_threshold,
+                )
+                pred_count = float(len(kept))
+
+        if dump and mode != "zero-shot":
+            rows.append({"image": sample['image_name'], "class": class_name, "gt": gt_count,
+                         "pred": round(pred_count, 2), "coarse": round(aux['coarse'].sum().item(), 2),
+                         "size_px": round(2 ** gt_sizes[-1], 1),
+                         "max_cell": round(density_map.max().item(), 4)})
+        abs_err += abs(pred_count - gt_count)
+        sq_err += (pred_count - gt_count) ** 2
+        errors.append(pred_count - gt_count)
+
+    if rows:
+        with open(dump, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0]))
+            w.writeheader()
+            w.writerows(rows)
+        print(f"  Đã ghi kết quả từng ảnh: {dump}")
+
+    if n_images > 0:
+        tag = f"{mode}, {split}" + (f", exemplars={exemplars}" if mode != "zero-shot" else "")
+        if zoom:
+            tag += f", zoom={zoom:g}px"
+        print(f"\n=== KẾT QUẢ BENCHMARK FSC-147 [{tag}] ===")
+        print(f"  Tổng số ảnh đánh giá : {n_images}")
+        print(f"  MAE : {abs_err / n_images:.2f}")
+        print(f"  RMSE: {(sq_err / n_images) ** 0.5:.2f}")
+        if mode != "zero-shot":
+            e, g = np.array(errors), 2 ** np.array(gt_sizes)
+            print(f"  Bias: {e.mean():+.2f}")
+            for lo, hi in [(0, 24), (24, 40), (40, float('inf'))]:
+                m = (g >= lo) & (g < hi)
+                if m.any():
+                    print(f"  Vật {lo:g}-{hi:g}px (n={m.sum()}): MAE {np.abs(e[m]).mean():.2f} bias {e[m].mean():+.2f}")
+        if mode == "density-count":
+            print(f"  MAE density thô (bước 1): {coarse_err / n_images:.2f}")
+        if est_sizes:
+            est, gl = np.array(est_sizes), np.array(gt_sizes)
+            ok = ~np.isnan(est)
+            rank = lambda a: np.argsort(np.argsort(a))
+            print(f"  Scale Head: |log2| trung vị {np.median(np.abs(est[ok] - gl[ok])):.3f} | "
+                  f"Spearman {np.corrcoef(rank(est[ok]), rank(gl[ok]))[0, 1]:.3f}")
+        if zoom:
+            print(f"  Ảnh được zoom: {n_zoomed}/{n_images}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate YOLO-World on FSC-147")
+    parser = argparse.ArgumentParser(description="Evaluate counting on FSC-147")
+    parser.add_argument("--mode", choices=["zero-shot", "density-count", "density-nms", "soft-nms"],
+                        default="zero-shot")
+    parser.add_argument("--split", choices=["val", "test"], default="test")
     parser.add_argument("--limit", type=int, default=None, help="Giới hạn số ảnh đánh giá")
-    parser.add_argument("--conf", type=float, default=0.1, help="Confidence threshold (Zero-Shot mode)")
-    parser.add_argument("--iou", type=float, default=0.7, help="NMS IoU threshold (Zero-Shot mode)")
-    parser.add_argument("--density-nms", action="store_true", help="Dùng Density-Guided Soft-NMS")
-    parser.add_argument("--density-count", action="store_true",
-                        help="Dùng SUM(Density Map) để đếm trực tiếp (không NMS)")
+    parser.add_argument("--data-dir", default="data/FSC147")
+    parser.add_argument("--conf", type=float, default=0.1, help="Confidence threshold (zero-shot)")
+    parser.add_argument("--iou", type=float, default=0.7, help="NMS IoU threshold (zero-shot)")
+    parser.add_argument("--raw-conf", type=float, default=0.05, help="Ngưỡng lọc box thô trước Soft-NMS")
+    parser.add_argument("--score-threshold", type=float, default=0.1,
+                        help="Ngưỡng score sau suy giảm để một box được tính (soft-nms/density-nms)")
     parser.add_argument("--checkpoint", type=str, default="density_head_best.pth",
-                        help="Tên file checkpoint trong thư mục checkpoints/")
+                        help="Đường dẫn checkpoint hoặc tên file trong checkpoints/")
+    parser.add_argument("--exemplars", choices=["self", "gt"], default="self",
+                        help="Vị trí exemplar cho Self-Exemplar: đỉnh density thô (zero-shot) hoặc exemplar box GT")
+    parser.add_argument("--zoom", type=float, default=0.0,
+                        help="Canonical-Scale Zoom: kích thước vật chuẩn (px), 0 = tắt")
+    parser.add_argument("--zoom-max", type=int, default=6, help="Số ô tối đa mỗi chiều khi zoom")
+    parser.add_argument("--dump", default=None, help="Ghi CSV kết quả từng ảnh (gt, pred, kích thước vật...)")
     args = parser.parse_args()
 
     eval_fsc147(
+        split=args.split,
         limit=args.limit,
         conf=args.conf,
         iou=args.iou,
-        use_density_nms=args.density_nms,
-        use_density_count=args.density_count,
+        mode=args.mode,
         checkpoint=args.checkpoint,
+        raw_conf=args.raw_conf,
+        score_threshold=args.score_threshold,
+        data_dir=args.data_dir,
+        exemplars=args.exemplars,
+        zoom=args.zoom,
+        zoom_max=args.zoom_max,
+        dump=args.dump,
     )
