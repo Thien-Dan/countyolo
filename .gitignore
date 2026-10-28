@@ -57,6 +57,9 @@ kaggle_bench_run/
 
 # --- Checkpoint tốt nhất (head ~2.4MB, YOLO-World + DINOv2-small, test MAE 18.90) được giữ lại ---
 !checkpoints/density_head_best_vit_seed3_ep19_valmae21.44.pth
+!checkpoints/density_head_best_vit_exnoise.pth
+!checkpoints/density_head_best_vit_exmix2_ep20.pth
+checkpoints/countgd_box*
 
 # --- Môi trường ảo của dự án ---
 .venv/

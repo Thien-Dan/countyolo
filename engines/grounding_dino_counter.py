@@ -15,7 +15,9 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 
-DEFAULT_MODEL_ID = "IDEA-Research/grounding-dino-tiny"
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_COUNTGD_HF = os.path.join(_ROOT, "checkpoints", "countgd_box_hf")
+DEFAULT_MODEL_ID = _COUNTGD_HF if os.path.exists(_COUNTGD_HF) else "IDEA-Research/grounding-dino-tiny"
 
 
 class GroundingDinoCounter:
