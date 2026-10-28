@@ -3,7 +3,7 @@
 VideoCount, vá Canonical-Scale Tiling + NMS vào Stage 1, rồi so sánh các cấu hình trên Crystals / Penguins
 (chỉ text, giống Bảng 2 của paper CountVid: Crystals MAE 69.1, Penguins MAE 4.0).
 
-    python kaggle_countvid_launch.py --username <kaggle_user> [--datasets crystals penguins] [--push]
+    python launchers/kaggle_countvid_launch.py --username <kaggle_user> [--datasets crystals penguins] [--push]
 
 Theo dõi:  kaggle kernels status <user>/countvid-tiling
 Kết quả:   kaggle kernels output <user>/countvid-tiling -p <dir>   (results.json)
@@ -14,7 +14,14 @@ import json
 import os
 import subprocess
 
-SOURCES = ["countvid_ext/tiled_countgd.py", "countvid_ext/patch_countvid.py", "countvid_ext/run_videocount.py"]
+SOURCES = ["countvid_ext/tiled_countgd.py", "countvid_ext/patch_countvid.py", "countvid_ext/run_videocount.py",
+           # Stage 1 bằng CountYOLO: code model + tiling, nạp theo đường dẫn trong CountVid
+           "countvid_ext/countyolo_stage1.py", "models/density_yolo.py", "utils/scale_zoom.py",
+           "engines/sam3_counter.py"]
+SAM3_DATASET = "nadthien/sam3-weights"  # dataset riêng tư chứa sam3.pt
+# Checkpoint CountYOLO tốt nhất (YOLO-World + DINOv2-small) trên GitHub
+COUNTYOLO_CKPT_URL = ("https://raw.githubusercontent.com/Thien-Dan/countyolo/master/checkpoints/"
+                      "density_head_best_vit_seed3_ep19_valmae21.44.pth")
 SLUG = "countvid-tiling"
 OUT_DIR = "kaggle_countvid_run"
 # Cấu hình so sánh: tên -> cờ thêm cho count_in_videos.py
@@ -22,6 +29,11 @@ CONFIGS = {
     "baseline": "",
     "grid2": "--tile_grid 2 --nms_iou 0.5",
     "grid3": "--tile_grid 3 --nms_iou 0.5",
+    # @CY@ = thư mục code CountYOLO, @CK@ = checkpoint, @TTN@ = cờ test-time tiling (thay khi tạo kernel)
+    "countyolo": "--stage1_countyolo @CY@ --countyolo_ckpt @CK@",
+    "countyolo_ttn": "--stage1_countyolo @CY@ --countyolo_ckpt @CK@ @TTN@",
+    # frame chính SAM 3 (có mặt + exemplar đúng lớp) mỗi @KF@ frame; @S3@ = sam3.pt
+    "countyolo_sam3kf": "--stage1_countyolo @CY@ --countyolo_ckpt @CK@ --countyolo_sam3 @S3@ --countyolo_kf_every @KF@",
 }
 
 RUNNER = r'''
@@ -29,6 +41,8 @@ import base64, glob, json, os, subprocess, sys
 FILES = __FILES__
 DATASETS = __DATASETS__
 CONFIGS = __CONFIGS__
+VIDEOS = __VIDEOS__
+COUNTYOLO_CKPT_URL = __CKPT_URL__
 COUNTGD_BOX_GDRIVE = "1bw-YIS-Il5efGgUqGVisIZ8ekrhhf_FD"
 VIDEOCOUNT_GDRIVE = "1elk1-83dstQ0hEPLctrLKUNz4qUkrdDs"
 SAM_URL = "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt"
@@ -99,12 +113,23 @@ vc_root = os.path.dirname(os.path.dirname(anno[0]))
 print("VideoCount:", vc_root, os.listdir(vc_root), flush=True)
 
 results = os.path.join(W, "results.json")
+if any("@S3@" in e for e in CONFIGS.values()):
+    w = glob.glob("/kaggle/input/**/sam3.pt", recursive=True)
+    if not w:
+        sys.exit("Không thấy sam3.pt trong /kaggle/input (dataset sam3-weights)")
+    CONFIGS = {k: v.replace("@S3@", w[0]) for k, v in CONFIGS.items()}
+if any("@CY@" in e for e in CONFIGS.values()):
+    run("pip install -q -U ultralytics")
+    cy_ckpt = os.path.join(W, "countyolo_best.pth")
+    run(f"wget -q -O {cy_ckpt} {COUNTYOLO_CKPT_URL}")
+    CONFIGS = {k: v.replace("@CY@", W).replace("@CK@", cy_ckpt) for k, v in CONFIGS.items()}
+videos = f" --videos {' '.join(VIDEOS)}" if VIDEOS else ""
 try:
     run(f"python {ext}/patch_countvid.py {cv}")
     for ds in DATASETS:
         for name, extra in CONFIGS.items():
             run(f'python {ext}/run_videocount.py --countvid_dir {cv} --data_root {vc_root} --checkpoint_dir {ck} '
-                f'--dataset {ds} --name {name} --extra="{extra}" --results {results}', check=False)
+                f'--dataset {ds} --name {name} --extra="{extra}" --results {results}{videos}', check=False)
     print("\n===== TỔNG KẾT =====", flush=True)
     for k, v in (json.load(open(results)) if os.path.exists(results) else {}).items():
         print(f"{k:24s} MAE {v['mae']:7.2f}  RMSE {v['rmse']:7.2f}  bias {v['bias']:+7.2f}  {v['sec']:6.0f}s",
@@ -122,35 +147,44 @@ def main():
     parser.add_argument("--datasets", nargs="+", default=["crystals", "penguins"],
                         choices=["crystals", "penguins", "mot20"])
     parser.add_argument("--configs", nargs="+", default=list(CONFIGS), choices=list(CONFIGS))
+    parser.add_argument("--videos", nargs="+", default=None, help="Chỉ chạy các video này (vd MOT20-01)")
+    parser.add_argument("--ttn-thr", type=float, default=0.0, help="Cho cấu hình countyolo_ttn")
+    parser.add_argument("--ttn-grid", type=int, default=2, help="Cho cấu hình countyolo_ttn")
+    parser.add_argument("--kf-every", type=int, default=30, help="Cho cấu hình countyolo_sam3kf")
+    parser.add_argument("--ckpt-url", default=COUNTYOLO_CKPT_URL, help="Checkpoint CountYOLO (URL)")
+    parser.add_argument("--slug-suffix", default="", help="Hậu tố tên kernel để chạy song song")
     parser.add_argument("--push", action="store_true", help="Đẩy kernel lên Kaggle và chạy ngay")
     args = parser.parse_args()
+    ttn = f"--countyolo_ttn_thr {args.ttn_thr:g} --countyolo_ttn_grid {args.ttn_grid}"
 
     files = {}
     for path in SOURCES:
         with open(path, "rb") as f:
             files[path] = base64.b64encode(f.read()).decode()
     runner = RUNNER.replace("__FILES__", repr(files)).replace("__DATASETS__", repr(args.datasets)) \
-        .replace("__CONFIGS__", repr({k: CONFIGS[k] for k in args.configs}))
+        .replace("__CONFIGS__", repr({k: CONFIGS[k].replace("@TTN@", ttn).replace("@KF@", str(args.kf_every))
+                                      for k in args.configs})) \
+        .replace("__VIDEOS__", repr(args.videos or [])).replace("__CKPT_URL__", repr(args.ckpt_url))
 
     os.makedirs(OUT_DIR, exist_ok=True)
     with open(os.path.join(OUT_DIR, "run.py"), "w", encoding="utf-8") as f:
         f.write(runner)
     meta = {
-        "id": f"{args.username}/{SLUG}",
-        "title": SLUG,
+        "id": f"{args.username}/{SLUG}{args.slug_suffix}",
+        "title": SLUG + args.slug_suffix,
         "code_file": "run.py",
         "language": "python",
         "kernel_type": "script",
         "is_private": True,
         "enable_gpu": True,
         "enable_internet": True,
-        "dataset_sources": [],
+        "dataset_sources": [SAM3_DATASET] if "countyolo_sam3kf" in args.configs else [],
         "competition_sources": [],
         "kernel_sources": [],
     }
     with open(os.path.join(OUT_DIR, "kernel-metadata.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=1)
-    print(f"Đã tạo {OUT_DIR}/ cho kernel {meta['id']}")
+    print(f"Đã tạo {OUT_DIR}/ cho kernel {meta['id']} | cấu hình {args.configs} | dữ liệu {args.datasets}")
 
     if args.push:
         subprocess.run(["kaggle", "kernels", "push", "-p", OUT_DIR], check=True)

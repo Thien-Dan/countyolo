@@ -3,8 +3,13 @@
 số tham số, độ trễ batch 1, thông lượng batch 8, bộ nhớ GPU đỉnh. Tốc độ không phụ thuộc trọng số đã
 train nên head được khởi tạo ngẫu nhiên.
 
-    python benchmark_speed.py --out bench_countyolo.json
+    python tools/benchmark_speed.py --out bench_countyolo.json
 """
+# Chạy được từ thư mục gốc dự án: python tools/<script>.py
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 import json
 import time
@@ -15,9 +20,18 @@ from models.density_yolo import DensityYOLOWorld
 
 VARIANTS = {
     "simcentric": dict(arch="simcentric"),
+    "vit-small-448": dict(arch="vit", vit_name="facebook/dinov2-small", vit_input=448),
     "vit-small-560": dict(arch="vit", vit_name="facebook/dinov2-small", vit_input=560),
     "vit-small-840": dict(arch="vit", vit_name="facebook/dinov2-small", vit_input=840),
     "vit-base-560": dict(arch="vit", vit_name="facebook/dinov2-base", vit_input=560),
+    # Tối ưu suy luận (model.optimize_inference): DINOv2 fp16 thật, tuỳ chọn torch.compile. "base" = biến thể gốc
+    # để kiểm tra số đếm không đổi (cùng seed khởi tạo head, cùng đầu vào).
+    "vit-small-560-fp16": dict(arch="vit", vit_name="facebook/dinov2-small", vit_input=560,
+                               opt=dict(half_vit=True), base="vit-small-560"),
+    "vit-small-448-fp16": dict(arch="vit", vit_name="facebook/dinov2-small", vit_input=448,
+                               opt=dict(half_vit=True), base="vit-small-448"),
+    "vit-small-560-fp16-compile": dict(arch="vit", vit_name="facebook/dinov2-small", vit_input=560,
+                                       opt=dict(half_vit=True, compile_vit=True), base="vit-small-560"),
 }
 
 
@@ -59,12 +73,22 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--weights", default="yolov8s-world.pt")
     p.add_argument("--out", default="bench_countyolo.json")
+    p.add_argument("--only", nargs="*", default=None, help="Chỉ đo các biến thể này")
     a = p.parse_args()
     print("GPU:", torch.cuda.get_device_name(0), flush=True)
-    results = {}
+    results, ref = {}, {}
+    torch.manual_seed(123)
+    x0 = torch.rand(1, 3, 640, 640, device="cuda")
     for name, cfg in VARIANTS.items():
+        if a.only and name not in a.only:
+            continue
+        cfg = dict(cfg)
+        opt, base = cfg.pop("opt", None), cfg.pop("base", None)
+        torch.manual_seed(0)  # cùng khởi tạo head giữa biến thể gốc và biến thể tối ưu
         model = DensityYOLOWorld(a.weights, **cfg).cuda()
         model.eval_mode()
+        if opt:
+            model.optimize_inference(**opt)
         classes = ["apple"]
         model.encode_text(classes)  # cache CLIP text, không tính vào thời gian
 
@@ -83,6 +107,13 @@ def main():
         total = n_params(model.yolo.model) + n_params(model.vit_extractor) + n_params(model.trainable_modules())
         results[name] = bench(name, run, total)
         results[name]["trainable_M"] = round(n_params(model.trainable_modules()) / 1e6, 2)
+        with torch.no_grad(), torch.autocast("cuda"):
+            c = float(model(x0, ["apple"])[1].float().sum())
+        ref[name] = c
+        if base in ref:
+            rel = abs(c - ref[base]) / max(abs(ref[base]), 1e-6)
+            results[name]["count_rel_diff_vs_base"] = round(rel, 5)
+            print(f"   {name}: số đếm {c:.3f} vs {base} {ref[base]:.3f} (lệch {rel * 100:.3f}%)", flush=True)
         del model
         torch.cuda.empty_cache()
     json.dump(results, open(a.out, "w"), indent=1)

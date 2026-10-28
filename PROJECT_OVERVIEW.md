@@ -3,7 +3,7 @@
 > **Cập nhật lần cuối:** 2026-10-14
 > Mô tả kiến trúc **đang chạy trong code** (`models/density_yolo.py`). Bản tốt nhất: arch `vit` (mục 0);
 > các mục 2–9 mô tả bản `simcentric` mà `vit` mở rộng.
-> `README.md` và `configs/countyolo_fsc147.yaml` là tầm nhìn v4 đầy đủ (ResNet-50, RepVL-PAN, NMSFreeHead,
+> `legacy/README_v4_vision.md` và `legacy/configs/countyolo_fsc147.yaml` là tầm nhìn v4 đầy đủ (ResNet-50, RepVL-PAN, NMSFreeHead,
 > LLM attributes…) — **chưa được triển khai**, không script nào đọc file YAML.
 
 ---
@@ -25,14 +25,14 @@ Sai số dồn vào ~9 ảnh test > 500 vật (bỏ 5 ảnh tệ nhất: MAE 14.
 YOLO-World, DINOv2-base, ViT 840px, mosaic 4×4, Canonical-Scale Zoom.
 
 ```bash
-# Train (Kaggle): python kaggle_launch.py --username <user> --vit --push
+# Train (Kaggle): python launchers/kaggle_launch.py --username <user> --vit --push
 python train_density_head.py --arch vit
 python eval_fsc147.py --mode density-count --checkpoint density_head_best_vit_seed3_ep19_valmae21.44.pth
-python benchmark_speed.py   # đo tốc độ các biến thể
+python tools/benchmark_speed.py   # đo tốc độ các biến thể
 ```
 
 `countvid_ext/`: Canonical-Scale Tiling + NMS cắm vào Stage 1 của CountVid (Crystals MAE 69.1 → 50.0,
-Penguins 3.33 → 1.67), chạy bằng `kaggle_countvid_launch.py`.
+Penguins 3.33 → 1.67), chạy bằng `launchers/kaggle_countvid_launch.py`.
 
 ---
 
@@ -40,7 +40,7 @@ Penguins 3.33 → 1.67), chạy bằng `kaggle_countvid_launch.py`.
 
 Đếm vật thể theo text prompt (zero-shot) trên FSC-147, không fine-tune backbone:
 YOLO-World đóng băng cung cấp feature, chỉ học các head nhỏ phía sau. Hướng mở rộng: exemplar few-shot,
-video (SAM 2.1, `count_in_videos_yoloworld.py` / `eval_mot20.py`).
+video (`video/count_light.py`, `countvid_ext/`; bản cũ ở `legacy/`).
 
 ---
 
@@ -148,14 +148,14 @@ Giới hạn: FSC-147 chỉ có ảnh 384px, nên phóng to không thêm chi ti�
 
 ---
 
-## 7. Chạy Trên Kaggle (`kaggle_launch.py`)
+## 7. Chạy Trên Kaggle (`launchers/kaggle_launch.py`)
 
 Đóng gói source vào một script kernel (không phụ thuộc GitHub), train rồi eval test/val và các mức zoom.
 
 ```bash
 # Windows: cần PYTHONUTF8=1 để in tiếng Việt
-python kaggle_launch.py --username nadthien --push              # train từ đầu (50 epoch, lr 1e-4)
-python kaggle_launch.py --username nadthien --finetune --push   # fine-tune từ output kernel train (15 epoch, lr 1e-5)
+python launchers/kaggle_launch.py --username nadthien --push              # train từ đầu (50 epoch, lr 1e-4)
+python launchers/kaggle_launch.py --username nadthien --finetune --push   # fine-tune từ output kernel train (15 epoch, lr 1e-5)
 kaggle kernels status nadthien/countyolo-density-train
 kaggle kernels output nadthien/countyolo-density-train -p <dir>
 ```
@@ -166,22 +166,7 @@ kaggle kernels output nadthien/countyolo-density-train -p <dir>
 
 ## 8. Cấu Trúc Thư Mục
 
-```
-countyolo/
-├── models/density_yolo.py         # DensityYOLOWorld + các head
-├── datasets/fsc147_dataset.py     # FSC-147 loader, mosaic, size_map
-├── datasets/density_generator.py  # Gaussian density (dự phòng)
-├── utils/custom_nms.py            # Density-Guided Soft-NMS
-├── utils/scale_zoom.py            # Canonical-Scale Zoom
-├── train_density_head.py          # Train / fine-tune
-├── eval_fsc147.py                 # Đánh giá FSC-147
-├── visualize_density.py           # So sánh density dự đoán vs GT
-├── kaggle_launch.py               # Đóng gói + đẩy kernel Kaggle
-├── train_kaggle.ipynb             # Notebook Kaggle (clone GitHub)
-├── count_in_videos_yoloworld.py   # Video: YOLO-World + SAM 2.1
-├── eval_mot20.py                  # Đánh giá MOT20
-└── configs/                       # countyolo_fsc147.yaml (chưa dùng), sam2.1/
-```
+Xem `README.md`.
 
 ---
 

@@ -2,7 +2,7 @@
 Kaggle kernel đo chi phí suy luận trên cùng một GPU: các biến thể CountYOLO (benchmark_speed.py) và CountGD-Box
 của CountVid (countvid_ext/bench_countgd.py). Tốc độ không phụ thuộc trọng số nên không cần checkpoint đã train.
 
-    python kaggle_bench_launch.py --username <kaggle_user> [--push]
+    python launchers/kaggle_bench_launch.py --username <kaggle_user> [--push]
 
 Kết quả: bench_countyolo.json, bench_countgd.json trong output kernel <user>/countyolo-bench.
 """
@@ -14,7 +14,7 @@ import subprocess
 
 SOURCES = [
     "models/density_yolo.py",
-    "benchmark_speed.py",
+    "tools/benchmark_speed.py",
     "countvid_ext/bench_countgd.py",
 ]
 SLUG = "countyolo-bench"
@@ -23,6 +23,8 @@ OUT_DIR = "kaggle_bench_run"
 RUNNER = r'''
 import base64, os, subprocess, sys
 FILES = __FILES__
+WITH_COUNTGD = __WITH_COUNTGD__
+ONLY = __ONLY__
 W = "/kaggle/working"
 cy = os.path.join(W, "countyolo")
 for path, b64 in FILES.items():
@@ -43,9 +45,13 @@ run("nvidia-smi --query-gpu=name,memory.total --format=csv")
 run("pip install -q ultralytics addict yapf==0.40.1 termcolor pycocotools 'transformers>=4.40,<5'")
 
 # 1. CountYOLO
-run(f"python benchmark_speed.py --out {W}/bench_countyolo.json", cwd=cy, check=False)
+only = f" --only {' '.join(ONLY)}" if ONLY else ""
+run(f"python tools/benchmark_speed.py --out {W}/bench_countyolo.json{only}", cwd=cy, check=False)
 
 # 2. CountGD-Box (CountVid): cài như kaggle_countvid_launch.py
+if not WITH_COUNTGD:
+    print("DONE (bỏ qua CountGD)", flush=True)
+    sys.exit(0)
 cv = os.path.join(W, "CountVid")
 run(f"git clone -q --depth 1 https://github.com/niki-amini-naieni/CountVid.git {cv}")
 run("pip install -q 'git+https://github.com/facebookresearch/sam2.git'", env=dict(os.environ, SAM2_BUILD_CUDA="0"))
@@ -73,13 +79,16 @@ print("\nDONE", flush=True)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--username", required=True)
+    parser.add_argument("--countyolo-only", action="store_true", help="Chỉ đo CountYOLO (CountGD đã đo: 422 ms AMP)")
+    parser.add_argument("--slug-suffix", default="")
+    parser.add_argument("--only", nargs="*", default=None, help="Chỉ đo các biến thể này")
     parser.add_argument("--push", action="store_true")
     args = parser.parse_args()
     files = {p: base64.b64encode(open(p, "rb").read()).decode() for p in SOURCES}
     os.makedirs(OUT_DIR, exist_ok=True)
     with open(os.path.join(OUT_DIR, "run.py"), "w", encoding="utf-8") as f:
-        f.write(RUNNER.replace("__FILES__", repr(files)))
-    meta = {"id": f"{args.username}/{SLUG}", "title": SLUG, "code_file": "run.py", "language": "python",
+        f.write(RUNNER.replace("__FILES__", repr(files)).replace("__WITH_COUNTGD__", str(not args.countyolo_only)).replace("__ONLY__", repr(args.only or [])))
+    meta = {"id": f"{args.username}/{SLUG}{args.slug_suffix}", "title": SLUG + args.slug_suffix, "code_file": "run.py", "language": "python",
             "kernel_type": "script", "is_private": True, "enable_gpu": True, "enable_internet": True,
             "dataset_sources": [], "competition_sources": [], "kernel_sources": []}
     with open(os.path.join(OUT_DIR, "kernel-metadata.json"), "w", encoding="utf-8") as f:

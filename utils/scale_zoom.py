@@ -70,3 +70,96 @@ def canonical_scale_count(model, image, class_name, device, target=44.0, min_zoo
         total += float(dz.float().sum())
     info["zoomed"] = len(crops)
     return total, info
+
+
+def _peak_boxes(density, log_size, count, stride=8.0, default_side=24.0, min_mass=0.0):
+    """round(count) đỉnh cục bộ mạnh nhất của density (H, W) -> box vuông xyxy quanh tâm ô, cạnh = kích thước vật
+    Scale Head dự đoán tại ô đó (px ảnh 640). Không có Scale Head -> cạnh default_side.
+    min_mass: bỏ đỉnh có tổng density 3x3 quanh nó < min_mass (một vật ~ khối lượng 1); đỉnh yếu trên nền
+    thường là phát hiện giả, mỗi cái thành một track giả khi đếm video. Score trả về = khối lượng 3x3."""
+    d = density[None, None]
+    peaks = torch.where(d == torch.nn.functional.max_pool2d(d, 3, stride=1, padding=1), d, torch.zeros_like(d))[0, 0]
+    mass = (torch.nn.functional.avg_pool2d(d, 3, stride=1, padding=1) * 9)[0, 0]
+    peaks = torch.where((peaks > 0) & (mass >= min_mass), mass, torch.zeros_like(mass))
+    k = min(int(round(count)), int((peaks > 0).sum()))
+    if k == 0:
+        return torch.zeros(0, 4), torch.zeros(0)
+    vals, idx = peaks.flatten().topk(k)
+    W = density.shape[-1]
+    cx = (idx % W).float() * stride + stride / 2
+    cy = (idx // W).float() * stride + stride / 2
+    side = 2 ** log_size.flatten()[idx] if log_size is not None else torch.full_like(cx, default_side)
+    half = side / 2
+    return torch.stack([cx - half, cy - half, cx + half, cy + half], 1).cpu(), vals.cpu()
+
+
+def _sample_feats(feats, boxes, size):
+    """Feature (1, D, h, w) lấy tại tâm box (toạ độ ảnh size x size), chuẩn hoá L2 -> (N, D)."""
+    if feats is None:
+        return None
+    if len(boxes) == 0:
+        return torch.zeros(0, feats.shape[1])
+    c = (boxes[:, :2] + boxes[:, 2:]) / 2 / size * 2 - 1  # [-1, 1]
+    grid = c.to(feats.device, feats.dtype).view(1, -1, 1, 2)
+    f = torch.nn.functional.grid_sample(feats, grid, align_corners=False)[0, :, :, 0].T.float()
+    return torch.nn.functional.normalize(f, dim=1).cpu()
+
+
+@torch.no_grad()
+def density_tiled_count(model, image, class_name, device, count_thr=0.0, grid=2, size=640, return_boxes=False,
+                        min_mass=0.0, protos=None):
+    """
+    Test-time tiling kích hoạt theo số đếm: đếm toàn ảnh; nếu count >= count_thr (> 0) thì chia ảnh gốc thành
+    grid x grid ô không chồng lấn, mỗi ô resize về size, đếm lại và cộng (density có tính cộng). Nhắm vào ảnh
+    rất đông mà mô hình đếm thiếu: trong mỗi ô vật to lên grid lần và mật độ mỗi ô gần phân bố lúc train hơn.
+
+    Args:
+        image: PIL.Image gốc (RGB)
+        return_boxes: trả thêm box vuông tại round(count) đỉnh density (hệ toạ độ ảnh gốc) + score, dùng làm
+            box prompt (vd Stage 1 của CountVid)
+        min_mass: ngưỡng khối lượng density 3x3 của đỉnh khi tạo box (xem _peak_boxes)
+        protos: prototype exemplar cho trước (aux["protos"] của model, vd từ frame chính có exemplar SAM 3)
+    Returns:
+        count, info {"count_full", "tiled", "density" (lần đếm toàn ảnh, H x W), "feats" (N, D) feature DINOv2
+        tại từng box hoặc None} [, boxes (N, 4), scores (N,)]
+    """
+    iw, ih = image.size
+
+    def run(img):
+        x = TF.to_tensor(img.convert("RGB").resize((size, size)))[None].to(device)
+        _, density, aux = model(x, [class_name], return_aux=True, exemplar_protos=protos)
+        d = density[0, 0].float()
+        ls = aux["log_size"][0, 0].float() if aux.get("log_size") is not None else None
+        return d, ls, aux.get("vit_feats")
+
+    d, ls, vf = run(image)
+    count_full = float(d.sum())
+    info = {"count_full": count_full, "tiled": False, "density": d.cpu(), "feats": None}
+    if count_thr <= 0 or count_full < count_thr or grid < 2:
+        if not return_boxes:
+            return count_full, info
+        b, s = _peak_boxes(d, ls, count_full, min_mass=min_mass)
+        info["feats"] = _sample_feats(vf, b, size)
+        return count_full, info, b * torch.tensor([iw / size, ih / size] * 2), s
+
+    info["tiled"] = True
+    xs = [round(i * iw / grid) for i in range(grid + 1)]
+    ys = [round(i * ih / grid) for i in range(grid + 1)]
+    total, boxes, scores, feats = 0.0, [], [], []
+    for i in range(grid):
+        for j in range(grid):
+            x0, y0, x1, y1 = xs[j], ys[i], xs[j + 1], ys[i + 1]
+            dt, lt, ft = run(image.crop((x0, y0, x1, y1)))
+            c = float(dt.sum())
+            total += c
+            if return_boxes:
+                b, s = _peak_boxes(dt, lt, c, min_mass=min_mass)
+                feats.append(_sample_feats(ft, b, size))
+                b = b * torch.tensor([(x1 - x0) / size, (y1 - y0) / size] * 2) + torch.tensor([x0, y0, x0, y0])
+                boxes.append(b)
+                scores.append(s)
+    if not return_boxes:
+        return total, info
+    if all(f is not None for f in feats) and feats:
+        info["feats"] = torch.cat(feats)
+    return total, info, torch.cat(boxes), torch.cat(scores)

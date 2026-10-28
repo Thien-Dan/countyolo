@@ -1,15 +1,15 @@
+# torch / torchvision cài riêng theo CUDA, vd:
+#   pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 torch>=2.0.0
 torchvision>=0.15.0
-transformers>=4.35.0
+ultralytics                 # YOLO-World (tự tải yolov8s-world.pt + CLIP)
+transformers>=4.40,<5       # DINOv2; v5 bỏ BertModel.get_head_mask mà CountVid cần
+numpy<2.3
 scipy
-tqdm
-pyyaml
-wandb
-pillow
 opencv-python
-numpy
-ultralytics
-# SAM 2.1 (cài qua git):
-# pip install git+https://github.com/facebookresearch/sam2.git
-# hydra-core
-# iopath
+pillow
+matplotlib
+tqdm
+gradio                      # app/app.py
+# Chỉ cho launchers/ (Kaggle) và countvid_ext/ (chạy trong môi trường CountVid):
+# kaggle, gdown, sam2 (git+https://github.com/facebookresearch/sam2.git)
