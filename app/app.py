@@ -45,8 +45,9 @@ SIZE = 640
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 _MODEL = {"path": None, "model": None}
 _SAM3 = {"counter": None}
+_GDINO = {"counter": None}
 _VERIFY = {"model": None, "vc": None}
-ENGINES = ["SAM 3", "CountYOLO"]
+ENGINES = ["SAM 3", "Grounding DINO", "CountYOLO"]
 
 
 def get_sam3():
@@ -58,6 +59,14 @@ def get_sam3():
         except FileNotFoundError as e:
             raise gr.Error(str(e))
     return _SAM3["counter"]
+
+
+def get_grounding_dino():
+    """Engine Grounding DINO (NMS-Free, Query-based Transformer)."""
+    if _GDINO["counter"] is None:
+        from engines.grounding_dino_counter import GroundingDinoCounter
+        _GDINO["counter"] = GroundingDinoCounter()
+    return _GDINO["counter"]
 
 
 def draw_boxes(img, boxes, ids=None):
@@ -117,7 +126,8 @@ def draw_points(img, boxes, ids=None, radius=None):
 
 # ----------------------------------------------------------------- Ảnh
 @torch.no_grad()
-def count_image(engine, image, text, exemplars, verify, use_tiling, ttn_thr, min_mass, ckpt):
+def count_image(engine, image, text, exemplars, verify, use_tiling, ttn_thr, min_mass, ckpt,
+                gd_box_thr=0.10, gd_text_thr=0.10):
     if image is None or not text.strip():
         raise gr.Error("Cần ảnh và tên vật cần đếm (vd: apples, people, penguins).")
     if engine == "SAM 3":
@@ -128,6 +138,16 @@ def count_image(engine, image, text, exemplars, verify, use_tiling, ttn_thr, min
                    f"- {r['count']} đối tượng được phát hiện + tách mask{tiled}\n"
                    f"- Thời gian: {r['ms']:.0f} ms\n"
                    f"- SAM 3 trả về box từng vật, không có density / bản đồ trung gian (chọn engine CountYOLO để xem)")
+        return summary, draw_boxes(image, r["boxes"]), gr.update(value=None, visible=False), \
+            gr.update(value=[], visible=False)
+    if engine == "Grounding DINO":
+        gd = get_grounding_dino()
+        r = gd.count_image(Image.fromarray(image), text.strip(), box_threshold=gd_box_thr, text_threshold=gd_text_thr)
+        summary = (f"## Đếm được: **{r['count']}** \"{text.strip()}\"  (Grounding DINO)\n"
+                   f"- {r['count']} đối tượng được phát hiện (NMS-Free Transformer Queries)\n"
+                   f"- Thời gian: {r['ms']:.0f} ms trên {DEVICE.type.upper()}\n"
+                   f"- Ngưỡng tự tin: box_threshold={gd_box_thr:.2f}, text_threshold={gd_text_thr:.2f}\n"
+                   f"- Cơ chế NMS-Free: bắt trọn các vật dày đặc chồng lấn mà không bị NMS triệt tiêu")
         return summary, draw_boxes(image, r["boxes"]), gr.update(value=None, visible=False), \
             gr.update(value=[], visible=False)
     model = get_model(ckpt)
@@ -293,8 +313,8 @@ def build(ckpts, default):
     with gr.Blocks(title="CountYOLO") as demo:
         gr.Markdown("# CountYOLO — đếm vật theo text (YOLO-World + DINOv2)")
         with gr.Row():
-            engine = gr.Radio(ENGINES, value="SAM 3" if os.path.exists(SAM3_WEIGHTS) else "CountYOLO",
-                              label="Engine (SAM 3: ổn định, nghe đúng text · CountYOLO: mô hình nghiên cứu, nhanh)")
+            engine = gr.Radio(ENGINES, value="Grounding DINO",
+                              label="Engine (SAM 3: tách mask · Grounding DINO: NMS-Free queries · CountYOLO: density map)")
             ckpt = gr.Dropdown(ckpts, value=default, label="Checkpoint CountYOLO")
         with gr.Tab("Đếm ảnh"):
             exemplars = gr.State([])
@@ -307,10 +327,13 @@ def build(ckpts, default):
                     with gr.Row():
                         clear = gr.Button("Xoá exemplar")
                         run = gr.Button("Đếm", variant="primary")
-                    with gr.Accordion("Tuỳ chọn", open=False):
+                    with gr.Accordion("Tuỳ chọn CountYOLO", open=False):
                         tiling = gr.Checkbox(True, label="Chia ảnh 2×2 khi rất đông")
                         thr = gr.Slider(50, 1000, 400, step=50, label="Ngưỡng chia ô (số đếm)")
                         mm = gr.Slider(0, 0.7, 0.2, step=0.05, label="min_mass khi vẽ điểm vật")
+                    with gr.Accordion("Tuỳ chọn Grounding DINO", open=False):
+                        gd_box_thr = gr.Slider(0.01, 0.40, 0.10, step=0.01, label="Ngưỡng tự tin box (box_threshold)")
+                        gd_text_thr = gr.Slider(0.01, 0.40, 0.10, step=0.01, label="Ngưỡng tự tin text (text_threshold)")
                 with gr.Column(scale=1):
                     summary = gr.Markdown()
                     pts = gr.Image(label="Điểm vật")
@@ -319,7 +342,7 @@ def build(ckpts, default):
             img.select(add_exemplar, exemplars, [exemplars, ex_info])
             img.upload(lambda: ([], "Exemplar: 0/3 (để trống = tự chọn)"), None, [exemplars, ex_info])
             clear.click(lambda: ([], "Exemplar: 0/3 (để trống = tự chọn)"), None, [exemplars, ex_info])
-            inputs = [engine, img, text, exemplars, verify, tiling, thr, mm, ckpt]
+            inputs = [engine, img, text, exemplars, verify, tiling, thr, mm, ckpt, gd_box_thr, gd_text_thr]
             run.click(count_image, inputs, [summary, pts, heat, maps])
             text.submit(count_image, inputs, [summary, pts, heat, maps])
         with gr.Tab("Đếm video"):
