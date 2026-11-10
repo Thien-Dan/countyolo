@@ -77,3 +77,7 @@ experiments/sam3_memory_tasks.json
 
 # Local-only abandoned Drive/DVC setup (may contain OAuth credentials)
 .dvc/
+
+# Upstream license copies downloaded alongside local model weights
+/licenses/
+/checkpoints/licenses/

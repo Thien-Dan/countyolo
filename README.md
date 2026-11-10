@@ -167,11 +167,19 @@ Ba checkpoint CountYOLO (`seed3`, `exmix2`, `exnoise`) được lưu trong model
 public [ThienDan2705/countyolo-checkpoints](https://huggingface.co/ThienDan2705/countyolo-checkpoints).
 Git lưu manifest `checkpoints/huggingface.json` chứa commit cố định, kích thước và
 SHA-256. Công cụ tải kiểm tra toàn bộ file trước khi thay checkpoint local.
-SAM3, CountGD và pretrained backbone không thuộc lần upload này.
+Repo cũng lưu bản sao không chỉnh sửa của SAM3 và hai checkpoint chính của CountVid:
+`countgd_box.pth` + `sam2.1_hiera_large.pt`. Nguồn, giấy phép riêng từng file và
+checksum được ghi trong manifest và thư mục `licenses/` trên Hugging Face.
+BERT, YOLO-World và DINOv2 vẫn được tải qua quy trình upstream hiện có.
 
 ```powershell
 # Dùng môi trường local hiện có, không cần cài lại model
 .\.venv\Scripts\python.exe tools/download_checkpoints.py
+
+# Tải riêng SAM3 (~3,45 GB), CountVid (~1,85 GB), hoặc tất cả
+.\.venv\Scripts\python.exe tools/download_checkpoints.py --group sam3
+.\.venv\Scripts\python.exe tools/download_checkpoints.py --group countvid
+.\.venv\Scripts\python.exe tools/download_checkpoints.py --group all
 ```
 
 Repo trọng số public: người clone có thể tải trực tiếp, không cần đăng nhập hoặc
@@ -180,7 +188,10 @@ không cần import PyTorch.
 
 Các bản trọng số local được giữ nguyên. File `.pth` được bỏ khỏi phiên bản Git mới;
 lịch sử Git vẫn giữ phiên bản cũ. Hugging Face quản lý phiên bản trọng số trực tiếp,
-không cần DVC hoặc Google Drive cho ba checkpoint này.
+không cần DVC hoặc Google Drive để tải các checkpoint trong manifest.
+SAM3 được đặt ở `sam3.pt`, CountVid ở `checkpoints/`; dùng `--output-dir`
+để chọn một thư mục khác (ví dụ thư mục checkpoints của bản clone CountVid).
+Hash các file lớn được tính theo luồng, không cần nạp cả checkpoint vào RAM.
 
 Launcher Kaggle hiện vẫn dùng URL commit Git lịch sử cố định cho seed3 (có kiểm tra
 SHA-256) và dataset Kaggle riêng tư cho exnoise, nên không cần đổi job đang chạy.
