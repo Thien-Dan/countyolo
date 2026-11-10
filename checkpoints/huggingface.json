@@ -2,7 +2,7 @@
   "repo_id": "ThienDan2705/countyolo-checkpoints",
   "repo_type": "model",
   "revision": "cdcaac20d5178be2c6d7209ed525428a72345a1b",
-  "private": true,
+  "private": false,
   "files": [
     {
       "path": "checkpoints/density_head_best_vit_seed3_ep19_valmae21.44.pth",
