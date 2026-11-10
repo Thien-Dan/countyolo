@@ -321,3 +321,191 @@ cổng text nhân từng ô (vitgate, kể cả chưng cất SAM 3) · cổng m�
 - Đang chạy: `nadthien/countyolo-density-vit-exother` — fine-tune từ exnoise (dataset riêng tư `nadthien/countyolo-exnoise`),
   15 epoch, lr 3e-5; sau train: test, prompt_eval oracle, CLIP K=6.
 - C6 nằm QUEUED > 1 giờ trên nadthien → chạy song song bản giống hệt trên thiend27 (`thiend27/countyolo-density-vit-exother`, dataset riêng tư `thiend27/countyolo-exnoise`); lấy bản xong trước.
+
+## 2026-11-07 — VideoCount: đối chứng video thật và nhánh CountYOLO ưu tiên độ chính xác
+
+- Xác nhận baseline người dùng muốn: CountVid gốc = CountGD-Box + SAM 2; không gọi nhầm là DINOv2 + SAM 2.
+- Thêm CountYOLO proposal fusion: box YOLO-World chỉnh hình học đỉnh density, box SAM 3 trên keyframe,
+  NMS và lọc khối lượng đỉnh; dùng exnoise, keyframe mỗi 5 frame. Các biến thể cũ/exnoise/kf5 được giữ làm đối chứng.
+  Không khẳng định cải thiện trước khi có số video.
+- CountVid không nạp CountGD khi dùng Stage 1 CountYOLO (giảm bộ nhớ); baseline giữ nguyên model gốc.
+- SAM 3: bỏ fallback ID theo thứ tự box; thiếu ID thật thì báo lỗi. Ghi trace ID/box từng frame,
+  đếm ID thô và xuất hiện >=3 frame riêng; frame list được đóng gói FFV1 lossless theo luồng, dọn file tạm.
+- Evaluator: lưu từng video/prompt ngay khi xong, không ghi đè các prompt cùng video, lưu đầy đủ log,
+  có trạng thái incomplete/failed và manifest sampling. Lấy mẫu MOT20 đúng CountVid (ceil + round linspace).
+- Launcher mới và hàng đợi `experiments/video_tasks.json`: mỗi job độc lập, checksum nguồn/checkpoint,
+  xử lý quota, tự fetch, chốt dừng khi lỗi. Pilot Penguins-1 + MOT20-01; sau pilot chọn CountYOLO theo MAE rồi đánh giá
+  13 video (11 video heldout báo riêng). Baseline mới dùng ttdan2006 để chia tải; trọng số riêng tư ở nadthien.
+- Kết nối cả ba tài khoản đã kiểm tra thành công. Lỗi 401 ban đầu do access_token toàn cục cũ ghi đè legacy key;
+  sửa trong client, không sửa/xóa credential toàn cục. Hai tài khoản kia không có quyền đọc dataset trọng số của nadthien.
+- Lượt SAM 3 ngưỡng detection nội bộ 0.3 (Penguins-1, 34 frame, T4): GT 28, pred raw 77, pred hits>=3 71,
+  256.0 giây gồm nạp model/encode; đây là kết quả chẩn đoán một video, không phải MAE toàn bộ Penguins.
+  Đã xếp lượt `sam3_native` ngưỡng detection 0.5 (mặc định native) để đối chiếu công bằng với nhánh trước đây.
+- Kiểm tra: 7 kiểm tra CPU local đạt, 2 kiểm tra geometry đã đạt trên T4 ở job SAM 3;
+  bản vá áp vào nguồn CountVid chính thức và compile thành công. Bộ 9 kiểm tra sẽ chạy trước model ở các job mới.
+- Đã tải kết quả C6 exother cũ: checkpoint tự báo arch=simcentric, test MAE 23.49 và mosaic oracle 43%; không thay exnoise.
+- Theo dõi nền mỗi 60 giây: `outputs/video_benchmark/watcher.log`; tiến trình gửi tiếp khi có slot,
+  tự mở rộng sau pilot, dừng dispatch khi lỗi. Máy local chỉ đóng gói/API/tổng hợp, không chạy model.
+
+- Lượt baseline Penguins-1 đã suy luận xong (log ghi Total Number of Objects: 26, GT 28), nhưng lỗi serializer vì
+  CountVid cần file output JSON tồn tại sẵn. Đã khôi phục khởi tạo `{}` trước subprocess và bổ sung test mô phỏng
+  đúng contract này. Lượt lỗi được giữ trong history/archive và chạy lại; không tính vào metric chuẩn.
+- Sửa test packaging dùng fixture checkpoint (không đòi asset local ở bước kiểm tra trên Kaggle),
+  xử lý tranh chấp khóa để watcher chờ thay vì thoát. Các job đã gửi bằng evaluator cũ được thử lại đúng một lần.
+- Kết quả đối chiếu `sam3_native` (detection 0.5, output conf 0.3), Penguins-1: GT 28, raw 39,
+  hits>=3 37; 34 frame, 191.1 giây. Hoàn tất và đã tải JSON/trace; không coi là kết quả toàn bộ Penguins.
+  Bộ 8 test trong snapshot này đạt toàn bộ trên Kaggle. Snapshot sau bổ sung test khóa hàng đợi (tổng 9).
+- Watcher đã khởi động lại sau khi sửa khóa; đang theo dõi 2 tài khoản, chốt quota 2 session/tài khoản.
+  Trạng thái mới nhất và history là `experiments/video_tasks.json`; lỗi setup/serializer được lưu archive riêng.
+
+## 2026-11-07 — Kiểm tra tiến độ và sửa giới hạn tải dữ liệu
+
+- Penguins-1 (GT 28), các lượt hoàn tất và đã xác minh: CountYOLO cũ 28 (1268.2 s),
+  fusion 26 (1167.9 s), CountVid gốc 26 (1144.3 s), SAM 3 native 39 (191.1 s).
+  Fusion chưa tốt hơn bản cũ trên video này; chưa chọn cấu hình thắng khi thiếu MOT20.
+- Hai lượt tiếp bị Google Drive quota trước suy luận. Watcher dừng đúng chốt lỗi, không tự tiêu GPU lặp lại.
+- Tạo hai dataset riêng tư `nadthien/videocount-benchmark`, `ttdan2006/videocount-benchmark`:
+  1252 frame JPEG, 354.7 MiB, đủ 13 video. Giữ nguyên ảnh gốc; MOT20 được lấy mẫu đúng CountVid một lần.
+  Đã kiểm chứng cả 13 case, danh sách frame/hash, GT và từng byte ảnh trùng dữ liệu gốc.
+- Evaluator nhận biết cache presampled và đặt downsample_factor=1 cho CountVid để không lấy mẫu hai lần.
+  Mọi job mới gắn cache Kaggle; không tải VideoCount từ Drive nữa. Có hash sampling trong run_manifest.
+- Lưu lỗi cũ vào history/archive, gửi lại SAM 3 native MOT20-01, exnoise Penguins-1 và baseline MOT20-01.
+- Test: 8 kiểm tra CPU đạt (gồm regression cache không lấy mẫu hai lần); 2 kiểm tra geometry dùng Torch
+  đã đạt trên Kaggle ở các lượt trước. Bộ mới tổng 10 kiểm tra sẽ chạy trước mỗi lượt suy luận.
+
+## 2026-11-07 — Cache CountGD-Box sau xác nhận upload
+
+- Người dùng xác nhận upload `checkpoints/countgd_box.pth` lên dataset riêng tư `ttdan2006/countvid-weights`.
+- Upload hoàn tất; Kaggle báo ready, file 954749856 byte. SHA-256:
+  `dc550ecb35dec9bb6608c53523a250eac84a6208bce00ab444cadb4a0903cfcd`.
+- Baseline mới gắn dataset này, kiểm checksum rồi nạp model; bỏ tải CountGD-Box từ Google Drive.
+  Ghi checksum vào run_manifest và kiểm lại khi tải kết quả. Lượt lỗi quota cũ được lưu history/archive.
+- Kiểm tra CPU: 9 đạt, 2 geometry cần Torch vẫn được kiểm trên Kaggle. Bộ hiện tại 11 kiểm tra.
+
+## 2026-11-08 — Kết quả qua đêm và chẩn đoán tiếp
+
+- Hàng đợi chính đã chuyển sang full sau pilot, chọn `countyolo_old` theo MAE pilot 2.0
+  (fusion 6.0, kf5 12.5, exnoise 18.0). Tổng 43/47 lượt hoàn tất; 4 lượt lỗi đều timeout 14400 s:
+  CountVid và CountYOLO cũ trên MOT20-02, MOT20-05. Benchmark toàn bộ chưa hoàn tất.
+- Penguins đủ 3 video: MAE CountYOLO cũ 2.333, CountVid 3.333, SAM 3 Ultralytics 20.667.
+- Crystals đủ 7 video: MAE CountYOLO cũ 74.714, CountVid 69.143, SAM 3 Ultralytics 48.857.
+  Cả 7 clip CountYOLO cũ đếm 0. Đối chiếu log: mọi SAM 3 keyframe đều không có detection, nên hard gate
+  chặn mọi proposal trước SAM 2. Đây là lỗi chính sách của pipeline, chưa đo được năng lực density head khi không bị chặn.
+- Thêm `absence_policy=fallback` tùy chọn: SAM 3 không thấy vật -> chạy CountYOLO với exemplar tự chọn;
+  mặc định block giữ nguyên đối chứng. Dùng seed3, không đổi checkpoint hoặc thêm fusion.
+- Gửi 2 lượt chẩn đoán riêng trên Crystals ma2035_023 và ma2035_039. Đây là development sau khi quan sát heldout,
+  không trộn với benchmark cũ. Ledger: experiments/video_diagnostics.json.
+- Thêm baseline_batch30 trên MOT20-01 (pilot) để kiểm tra tính tương đương số đếm và tốc độ trước khi retry video dài.
+  Không chạy lại mù 4 lượt timeout. Model/prompt/frame/threshold giữ nguyên, chỉ đổi obj_batch_size 10 -> 30.
+- Cả 3 lượt chẩn đoán đã được gửi. Quota tại thời điểm kiểm tra: nadthien dùng ~19.32/30 GPU giờ,
+  ttdan2006 ~14.28/30; thời gian reserved được ghi bởi Kaggle, không phải số giờ đã thực dùng.
+- Kiểm tra: 9 kiểm tra CPU local đạt, 3 cần Torch chạy trên Kaggle (gồm regression absence gate);
+  bản vá áp đúng nguồn CountVid chính thức và compile thành công. Tổng hiện tại 12 kiểm tra.
+- Tách thư mục export theo ledger để chẩn đoán không ghi đè báo cáo benchmark chính.
+
+
+## 2026-11-08 — SAM3 setup audit
+
+- Inspected exact PyPI Ultralytics 8.4.204 and Meta SAM3 source at commit
+  f1647e8d0c1d280991f4d1b7d974c2704537fe66. Confirmed BGR input -> RGB
+  preprocessing, image size 1008 and mean/std 127.5 are consistent.
+- Ultralytics default tracker uses association .5, new detection threshold 0,
+  hotstart delay 0, while Meta temporal builder uses .1, .7, 15 respectively.
+  Other exposed Meta settings are recorded in video/sam3_policy.py. This does
+  not imply implementation parity with Meta (including lifetime heuristics).
+- Added delayed CPU frame records. Revocations affect pending frames only;
+  historical sightings of legitimately departed objects remain in the union.
+- Aligned postprocess drops final empty masks and recomputes remaining boxes;
+  checkpoint loading fails on missing required model parameters instead of
+  silently accepting an incomplete mapping with strict=False.
+- Added paired FP16/FP32 video jobs and a bounded image numerical probe. SAM3
+  weight checksum, precision, tracker settings and peak allocated CUDA memory
+  are recorded. Keep old benchmark results unchanged.
+- 16 checks: 13 passed locally, 3 torch-dependent checks reserved for Kaggle.
+  Three SAM3 diagnostics prepared in the existing diagnostic queue; watcher
+  PID 59380 polls every 60 s. GPU run results remain pending at preparation.
+
+
+## 2026-11-08 — Three-account SAM3 routing prepared
+
+- Verified thiend27 authentication, no active kernels in recent runs, 0/30 GPU
+  hours used; ttdan2006 14.84/30 hours, batch30 CountVid job complete.
+- Prepared two aligned SAM3 pilots for thiend27, FP32 plus image probe for
+  ttdan2006. Staging plan: outputs/sam3_three_accounts/routing.json. Main queue
+  is unchanged until access is approved and verified.
+- Auto-review rejected private dataset reader grants because explicit dataset
+  and destination account approval was required. Requested that approval:
+  nadthien/sam3-weights -> thiend27, ttdan2006 (READER);
+  nadthien/videocount-benchmark -> thiend27 (READER). Datasets stay private.
+  No sharing or duplicate upload was performed. Metadata snapshots saved.
+- Added explicit cross-account data_dataset/sam3_dataset packaging, preserved
+  during refresh. 17 checks: 14 pass locally; 3 require Kaggle torch.
+
+
+## 2026-11-08 — Three-account SAM3 execution activated
+
+- User explicitly approved the exact READER grants. Applied them, verified
+  both SAM3 weight readers and thiend27 benchmark access; datasets stay private.
+- Routed only the three still-prepared SAM3 jobs, preserving routing history:
+  thiend27: aligned Penguins-1, aligned MOT20-01;
+  ttdan2006: aligned FP32 Penguins-1 with paired image precision probes.
+- All three Kaggle submissions accepted. Existing two CountYOLO diagnostics
+  remain on nadthien. Diagnostic watcher PID 59380 continues every 60 seconds.
+- Completed CountVid batch30 pilot: 98/80 on MOT20-01 (same count as batch10),
+  1777.93 seconds for 52 frames. Parity verified on this pilot only.
+
+
+## 2026-11-08 — SAM3 setup results and next validation
+
+- All three SAM3 pilot diagnostics completed, all 17 remote tests passed;
+  both detector and tracker checkpoint audits report zero missing parameters
+  and buffers. Extra checkpoint keys are ignored by the upstream submodel maps.
+- Penguins-1, 34 identical sampled frames, GT28: legacy39 (191.07s),
+  aligned FP16 27 (178.03s), aligned FP32 27 (631.77s). Raw aligned IDs30;
+  delayed emitted IDs27. FP32 did not improve this count and cost ~3.55x.
+- MOT20-01, 52 identical sampled frames, GT80: legacy92 (442.59s),
+  aligned FP16 70 (428.90s); raw IDs74. Two-case MAE11.5 ->5.5.
+  These are pilot/development observations, not a full benchmark claim.
+- Numerical probes: Penguins first-frame image count33 in both precisions;
+  two Crystals first-frame image counts0 in both. All logits/boxes finite.
+  Low image presence logits suppress the image scores below conf .3. No
+  evidence of a precision failure on these probes; do not bypass presence
+  gating or change text/thresholds to fit known counts.
+- CountYOLO absence fallback ma2035_023 completed:46/111 in4050.01s,
+  vs old hard-gated0. Second fallback Crystals task is still running.
+- Continue frozen aligned FP16 settings on Penguins-2/3 (thiend27) and
+  Crystals ma2035_023/039 (ttdan2006). All four submissions accepted;
+  keep old benchmark and app defaults for now. No new threshold fitting.
+
+
+## 2026-11-08 — Validation exposed tracker memory failure
+
+- Diagnostic queue terminal:9 complete,1 failed; watcher59380 exited normally.
+- Aligned Penguins3:39/38; Penguins2 failed CUDA OOM in RoPE memory attention
+  (1.25GiB allocation with ~995MiB free on a14.56GiB T4). Do not report a full
+  Penguins metric for aligned until Penguins2 completes.
+- Aligned Crystals023:1/111;039:8/27. Fixed Meta-like settings are not a general
+  solution: severe undercount remains on these clips. Preserve those results.
+- CountYOLO fallback039:73/27 in10089.07s;023:46/111. Removing hard absence
+  restores proposals but is not sufficient for accurate crystal counting.
+- Added sam3_aligned_batch8, preserving resolution/thresholds/all detections,
+  splitting newly detected objects into ordered tracker states of at most8.
+  Test all IDs/masks/order preserved; no cap on total objects.18 tests:
+  15 passed locally;3 require torch on Kaggle.
+- Separate ledger experiments/sam3_memory_tasks.json retains the old OOM task,
+  runs Penguins1 count parity plus Penguins2 OOM recovery on thiend27.
+
+
+## 2026-11-08 — SAM3 tracker batch8 passed OOM recovery
+
+- Both memory diagnostics complete; all18 remote tests passed on each job.
+- Penguins1:27/28 unchanged from aligned unbatched;34 frames;177.37s;
+  peak allocated CUDA4156.77MiB vs7518.77MiB before (about45% reduction).
+- Penguins2:54/59 across all94 frames;839.38s;peak7267.48MiB. This clip
+  previously failed at~13.24GiB allocated in tracker attention. Batch8 completed
+  with no frame skipping, total-object cap, resolution or threshold change.
+- No full same-profile3-video Penguins score yet: Penguins3 is still the
+  unbatched aligned run. Crystals accuracy remains unresolved. Keep legacy
+  benchmark and app defaults, identify batch8 explicitly in new evaluations.
+- Queue experiments/sam3_memory_tasks.json:2/2 complete, no pending tasks.
+  Watcher85620 exited normally after downloading and verifying both outputs.

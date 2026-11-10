@@ -34,6 +34,10 @@ ARGS_PATCH = ARGS_ANCHOR + '''    # countvid_ext: Canonical-Scale Tiling + NMS c
     parser.add_argument("--countyolo_ttn_grid", type=int, default=2)
     parser.add_argument("--countyolo_sam3", type=str, default="")
     parser.add_argument("--countyolo_kf_every", type=int, default=0)
+    parser.add_argument("--countyolo_fusion", action="store_true")
+    parser.add_argument("--countyolo_min_mass", type=float, default=0.0)
+    parser.add_argument("--countyolo_yolo_conf", type=float, default=0.15)
+    parser.add_argument("--countyolo_absence_policy", choices=["block", "fallback"], default="block")
 '''
 
 # Stage 1 bằng CountYOLO: không gọi CountGD (logits rỗng -> không box nào qua CONF_THRESH), box do CountYOLO cấp
@@ -46,10 +50,16 @@ COUNT_PATCH = '''    if STAGE1 is not None:
         countgd_output = count(input_frame, input_image_exemplars, exemplars, label, input_text, device=args.device)
 '''
 
+BUILD_ANCHOR = "    from models.registry import MODULE_BUILD_FUNCS\n"
+BUILD_PATCH = "    if args.stage1_countyolo:\n        return None, data_transform\n" + BUILD_ANCHOR
+MOVE_ANCHOR = "model = model.to(device)\n"
+MOVE_PATCH = "if model is not None:\n    model = model.to(device)\n"
 MODEL_ANCHOR = "model, transform = build_model_and_transforms(args)\n"
 MODEL_PATCH = MODEL_ANCHOR + '''STAGE1 = CountYOLOStage1(args.stage1_countyolo, args.countyolo_ckpt, device=args.device,
                          ttn_thr=args.countyolo_ttn_thr, ttn_grid=args.countyolo_ttn_grid,
-                         sam3_weights=args.countyolo_sam3, kf_every=args.countyolo_kf_every) \\
+                         sam3_weights=args.countyolo_sam3, kf_every=args.countyolo_kf_every,
+                         min_mass=args.countyolo_min_mass, fusion=args.countyolo_fusion,
+                         yolo_conf=args.countyolo_yolo_conf, absence_policy=args.countyolo_absence_policy) \\
     if args.stage1_countyolo else None
 '''
 
@@ -98,13 +108,14 @@ def main(countvid_dir):
         print("Đã vá từ trước:", path)
         return
     for anchor, patch in [(IMPORT_ANCHOR, IMPORT_PATCH), (ARGS_ANCHOR, ARGS_PATCH), (BOX_ANCHOR, BOX_PATCH),
-                          (STAGE1_ANCHOR, STAGE1_PATCH), (COUNT_ANCHOR, COUNT_PATCH), (MODEL_ANCHOR, MODEL_PATCH)]:
+                          (STAGE1_ANCHOR, STAGE1_PATCH), (COUNT_ANCHOR, COUNT_PATCH), (MODEL_ANCHOR, MODEL_PATCH),
+                          (BUILD_ANCHOR, BUILD_PATCH), (MOVE_ANCHOR, MOVE_PATCH)]:
         if src.count(anchor) != 1:
             sys.exit(f"Không tìm thấy đúng 1 chỗ vá trong {path}:\n{anchor}")
         src = src.replace(anchor, patch)
     open(path, "w", encoding="utf-8").write(src)
     here = os.path.dirname(os.path.abspath(__file__))
-    for f in ("tiled_countgd.py", "countyolo_stage1.py"):
+    for f in ("tiled_countgd.py", "countyolo_stage1.py", "proposals.py"):
         shutil.copy(os.path.join(here, f), countvid_dir)
     print("Đã vá:", path)
 

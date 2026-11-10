@@ -2,7 +2,7 @@
 #   pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 torch>=2.0.0
 torchvision>=0.15.0
-ultralytics                 # YOLO-World (tự tải yolov8s-world.pt + CLIP)
+ultralytics==8.4.204        # YOLO-World (tự tải yolov8s-world.pt + CLIP)
 transformers>=4.40,<5       # DINOv2; v5 bỏ BertModel.get_head_mask mà CountVid cần
 numpy<2.3
 scipy

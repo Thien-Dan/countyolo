@@ -7,6 +7,8 @@ Engine đếm bằng SAM 3 (Meta, qua Ultralytics): text -> tìm + tách mask m�
 Trọng số `sam3.pt` phải tải từ https://huggingface.co/facebook/sam3 (cần được Meta duyệt quyền truy cập).
 """
 import os
+import collections
+import shutil
 import tempfile
 import time
 
@@ -49,7 +51,19 @@ class SAM3Counter:
             from ultralytics.models.sam import SAM3SemanticPredictor
             # imgsz 1008 = độ phân giải SAM 3 được train; mặc định 640 của Ultralytics làm đếm thiếu nặng
             # (FSC-147: táo 46 -> 81/82, kính râm 2 -> 150/253 ở conf 0.3)
-            self._img = SAM3SemanticPredictor(overrides=self._overrides(imgsz=1008))
+            class CheckedSemanticPredictor(SAM3SemanticPredictor):
+                def inference(inner, *args, **kwargs):
+                    out = super().inference(*args, **kwargs)
+                    inner.last_numerics = {}
+                    for key in ("pred_logits", "presence_logit_dec", "pred_boxes"):
+                        tensor = out[key]
+                        finite = bool(torch.isfinite(tensor).all())
+                        inner.last_numerics[key] = dict(finite=finite,
+                            min=float(tensor.min()), max=float(tensor.max()))
+                        if not finite:
+                            raise FloatingPointError(f"SAM3 produced non-finite {key}; check precision/checkpoint")
+                    return out
+            self._img = CheckedSemanticPredictor(overrides=self._overrides(imgsz=1008))
         return self._img
 
     def _detect(self, rgb, text):
@@ -94,32 +108,147 @@ class SAM3Counter:
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         return {"count": int(len(boxes)), "boxes": boxes.numpy(), "scores": scores.numpy(), "grid": g,
-                "ms": (time.perf_counter() - t0) * 1000}
+                "ms": (time.perf_counter() - t0) * 1000,
+                "numerics": getattr(self._img, "last_numerics", {})}
 
     @torch.no_grad()
-    def count_video(self, frames, text, fps=3, on_frame=None):
-        """frames: list PIL.Image / đường dẫn ảnh, hoặc đường dẫn file video. Trả về {"count", "frame_counts",
-        "frames", "sec"}; on_frame(i, image_rgb, boxes, ids, n) sau mỗi frame (dùng cho UI)."""
+    def count_video(self, frames, text, fps=3, on_frame=None, min_hits=1, trace_path=None, detection_conf=0.5, tracker_profile="legacy", object_batch_size=0):
+        """Count real track IDs; report raw and persistence-filtered counts separately.
+
+        Frame lists are streamed to lossless FFV1, avoiding lossy MP4 conversion
+        and loading an entire video into RAM. Missing IDs fail explicitly.
+        """
         from ultralytics.models.sam import SAM3VideoSemanticPredictor
-        src, tmp = frames, None
-        if not isinstance(frames, str):  # ghép frame thành mp4 tạm cho predictor video
-            imgs = [np.array((Image.open(f) if isinstance(f, str) else f).convert("RGB")) for f in frames]
-            h, w = imgs[0].shape[:2]
-            tmp = os.path.join(tempfile.mkdtemp(), "frames.mp4")
-            vw = cv2.VideoWriter(tmp, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-            for im in imgs:
-                vw.write(cv2.cvtColor(cv2.resize(im, (w, h)), cv2.COLOR_RGB2BGR))
-            vw.release()
-            src = tmp
-        pred = SAM3VideoSemanticPredictor(overrides=self._overrides(imgsz=1008))
-        ids_seen, frame_counts = set(), []
+        from video.sam3_policy import META_ALIGNED, DelayedTrackFrames, add_object_batches
+        if object_batch_size < 0:
+            raise ValueError("object_batch_size must be nonnegative")
+        if tracker_profile not in ("legacy", "aligned"):
+            raise ValueError(f"Unknown SAM3 tracker profile: {tracker_profile}")
+        # Lifecycle fields are an internal API: pin the audited implementation.
+        if tracker_profile == "aligned":
+            import ultralytics
+            if ultralytics.__version__ != "8.4.204":
+                raise RuntimeError("Aligned SAM3 requires audited ultralytics==8.4.204")
+        class LifecyclePredictor(SAM3VideoSemanticPredictor):
+            def _tracker_add_new_objects(inner, frame_idx, num_frames, new_obj_ids, new_obj_masks, tracker_states_local):
+                return add_object_batches(super()._tracker_add_new_objects, frame_idx, num_frames,
+                                          new_obj_ids, new_obj_masks, tracker_states_local, object_batch_size)
+
+            def setup_model(inner, *args, **kwargs):
+                # Upstream uses strict=False when mapping Meta checkpoint keys.
+                # Audit every required parameter instead of silently using random weights.
+                from unittest.mock import patch
+                original_load = torch.nn.Module.load_state_dict
+                inner.weight_load_reports = []
+                def audited_load(module, *load_args, **load_kwargs):
+                    incompatible = original_load(module, *load_args, **load_kwargs)
+                    missing_params = sorted(set(incompatible.missing_keys) & dict(module.named_parameters()).keys())
+                    report = dict(model=type(module).__name__, missing_parameters=missing_params,
+                                  missing_buffers=sorted(set(incompatible.missing_keys)-set(missing_params)),
+                                  unexpected_count=len(incompatible.unexpected_keys))
+                    inner.weight_load_reports.append(report)
+                    if missing_params:
+                        raise RuntimeError(f"Incomplete SAM3 checkpoint mapping: {missing_params[:12]}")
+                    return incompatible
+                with patch.object(torch.nn.Module, "load_state_dict", audited_load):
+                    super().setup_model(*args, **kwargs)
+                print("SAM3 checkpoint audit:", inner.weight_load_reports, flush=True)
+
+            def postprocess(inner, preds, img, orig_imgs):
+                inner.removed_ids = tuple(preds["removed_obj_ids"])
+                results = super().postprocess(preds, img, orig_imgs)
+                # Upstream builds boxes before enforcing mask exclusivity.
+                # Remove masks that became empty, then rebuild their geometry.
+                from ultralytics.models.sam.amg import batched_mask_to_box
+                for j, result in enumerate(results):
+                    if result.masks is not None:
+                        keep = result.masks.data.bool().flatten(1).any(1)
+                        result = result[keep]
+                        if len(result):
+                            result.boxes.data[:, :4] = batched_mask_to_box(result.masks.data.bool())
+                        results[j] = result
+                return results
+        if min_hits < 1:
+            raise ValueError("min_hits must be >= 1")
         t0 = time.perf_counter()
-        for i, r in enumerate(pred(source=src, text=[text], stream=True)):
-            data = r.boxes.data.cpu().numpy() if r.boxes is not None and len(r.boxes) else np.zeros((0, 7))
-            ids = data[:, 4].astype(int).tolist() if data.shape[1] >= 7 else list(range(len(data)))
-            ids_seen.update(ids)
-            frame_counts.append(len(data))
-            if on_frame is not None:
-                on_frame(i, r.orig_img[..., ::-1], data[:, :4], ids, len(data))
-        return {"count": len(ids_seen), "frame_counts": frame_counts, "frames": len(frame_counts),
-                "sec": time.perf_counter() - t0}
+        src, tmp_dir = frames, None
+        trace = None
+        writer = None
+        try:
+            if not isinstance(frames, str):
+                if not len(frames):
+                    raise ValueError("Video has no frames")
+                tmp_dir = tempfile.mkdtemp(prefix="sam3_video_")
+                src = os.path.join(tmp_dir, "frames.avi")
+                for i, f in enumerate(frames):
+                    if isinstance(f, str):
+                        with Image.open(f) as im:
+                            rgb = np.array(im.convert("RGB"))
+                    else:
+                        rgb = np.array(f.convert("RGB"))
+                    if i == 0:
+                        h, w = rgb.shape[:2]
+                        writer = cv2.VideoWriter(src, cv2.VideoWriter_fourcc(*"FFV1"), fps, (w, h))
+                        if not writer.isOpened():
+                            raise RuntimeError("FFV1 encoder unavailable; refusing lossy evaluation")
+                    if rgb.shape[:2] != (h, w):
+                        raise ValueError("Frame dimensions changed within one video")
+                    writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+                writer.release()
+                writer = None
+            encode_sec = time.perf_counter() - t0
+            predictor_cls = LifecyclePredictor if tracker_profile == "aligned" else SAM3VideoSemanticPredictor
+            settings = dict(META_ALIGNED) if tracker_profile == "aligned" else {}
+            pred = predictor_cls(overrides=self._overrides(imgsz=1008),
+                                 score_threshold_detection=detection_conf, **settings)
+            delayed = DelayedTrackFrames(settings.get("hotstart_delay", 0))
+            hits, raw_hits, frame_counts = collections.Counter(), collections.Counter(), []
+            def emit(record):
+                ids, xyxy = record["ids"], record["boxes"]
+                hits.update(set(ids))
+                frame_counts.append(len(ids))
+                if trace:
+                    trace.write(json.dumps({k: v for k, v in record.items() if k != "image"}) + "\n")
+                    trace.flush()
+                if on_frame is not None:
+                    on_frame(record["frame"], record["image"], np.asarray(xyxy).reshape(-1, 4), ids, len(ids))
+            if trace_path:
+                os.makedirs(os.path.dirname(trace_path) or ".", exist_ok=True)
+                trace = open(trace_path, "w", encoding="utf-8")
+            import json
+            for i, r in enumerate(pred(source=src, text=[text], stream=True)):
+                boxes = r.boxes
+                if boxes is None or len(boxes) == 0:
+                    ids, xyxy = [], np.zeros((0, 4))
+                else:
+                    if not boxes.is_track or boxes.id is None:
+                        raise RuntimeError("SAM 3 returned detections without persistent track IDs")
+                    ids = boxes.id.int().cpu().tolist()
+                    xyxy = boxes.xyxy.float().cpu().numpy()
+                raw_hits.update(set(ids))
+                record = dict(frame=i, ids=ids, boxes=xyxy.tolist())
+                if on_frame is not None:
+                    record["image"] = r.orig_img[..., ::-1].copy()
+                for ready in delayed.push(record, getattr(pred, "removed_ids", ())):
+                    emit(ready)
+            for ready in delayed.finish():
+                emit(ready)
+            if not frame_counts:
+                raise RuntimeError("SAM 3 processed no frames")
+            if not isinstance(frames, str) and len(frame_counts) != len(frames):
+                raise RuntimeError(f"Frame count mismatch: {len(frame_counts)} != {len(frames)}")
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            return {"count": sum(n >= min_hits for n in hits.values()), "raw_count": len(raw_hits), "tracker_profile": tracker_profile,
+                    "tracker_settings": settings, "precision": "fp16" if self.half else "fp32",
+                    "hotstart_delay": delayed.delay, "object_batch_size": object_batch_size, "weight_load_reports": getattr(pred, "weight_load_reports", []),
+                    "min_hits": min_hits, "detection_conf": detection_conf, "track_hits": dict(hits), "frame_counts": frame_counts,
+                    "frames": len(frame_counts), "encode_sec": encode_sec,
+                    "sec": time.perf_counter() - t0}
+        finally:
+            if writer is not None:
+                writer.release()
+            if trace:
+                trace.close()
+            if tmp_dir:
+                shutil.rmtree(tmp_dir)

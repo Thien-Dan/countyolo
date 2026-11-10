@@ -7,6 +7,7 @@ Phương pháp phát hiện đối tượng Zero-Shot / Open-Vocabulary dựa tr
   nên phát hiện cực tốt các đối tượng dày đặc, chồng lấn hoặc đè lên nhau.
 - Cross-Modality: Tương tác sâu giữa đặc trưng ngôn ngữ (BERT) và đặc trưng thị giác (Swin Transformer).
 """
+import os
 import time
 from typing import Dict, Any, Optional
 

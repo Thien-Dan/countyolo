@@ -17,10 +17,10 @@ import subprocess
 SOURCES = ["countvid_ext/tiled_countgd.py", "countvid_ext/patch_countvid.py", "countvid_ext/run_videocount.py",
            # Stage 1 bằng CountYOLO: code model + tiling, nạp theo đường dẫn trong CountVid
            "countvid_ext/countyolo_stage1.py", "models/density_yolo.py", "utils/scale_zoom.py",
-           "engines/sam3_counter.py"]
+           "engines/sam3_counter.py", "countvid_ext/proposals.py", "video/eval_common.py"]
 SAM3_DATASET = "nadthien/sam3-weights"  # dataset riêng tư chứa sam3.pt
 # Checkpoint CountYOLO tốt nhất (YOLO-World + DINOv2-small) trên GitHub
-COUNTYOLO_CKPT_URL = ("https://raw.githubusercontent.com/Thien-Dan/countyolo/master/checkpoints/"
+COUNTYOLO_CKPT_URL = ("https://raw.githubusercontent.com/Thien-Dan/countyolo/45cfbd6f42ca02a6df7b3fd4c992d5c3dac5342d/checkpoints/"
                       "density_head_best_vit_seed3_ep19_valmae21.44.pth")
 SLUG = "countvid-tiling"
 OUT_DIR = "kaggle_countvid_run"

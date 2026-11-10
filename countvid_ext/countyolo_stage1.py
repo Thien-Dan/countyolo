@@ -9,6 +9,8 @@ Tuỳ chọn frame chính SAM 3 (sam3_weights, kf_every > 0): cứ kf_every fram
   - không thấy vật nào của lớp được hỏi -> các frame tới frame chính sau không có box (chống đếm nhầm lớp)
   - có -> tâm các box SAM 3 điểm cao nhất làm exemplar, lấy prototype của CountYOLO tại đó và dùng cho mọi frame
     tới frame chính sau (CountYOLO đếm "vật giống exemplar" thay vì đỉnh density của chính frame).
+absence_policy="fallback": nếu SAM 3 không phát hiện được vật, dùng exemplar tự chọn của CountYOLO thay vì chặn mọi box.
+Đây là biến thể chẩn đoán; mặc định "block" giữ nguyên đối chứng.
 Chi phí SAM 3 (~0.2 s / lượt trên T4) chia đều cho kf_every frame.
 """
 import importlib.util
@@ -28,7 +30,11 @@ def _load(name, path):
 
 class CountYOLOStage1:
     def __init__(self, countyolo_dir, checkpoint, device="cuda", ttn_thr=0.0, ttn_grid=2, min_mass=0.0,
-                 sam3_weights="", kf_every=0, sam3_conf=0.2, n_exemplars=5):
+                 sam3_weights="", kf_every=0, sam3_conf=0.2, n_exemplars=5,
+                 fusion=False, yolo_conf=0.15, absence_policy="block"):
+        if absence_policy not in ("block", "fallback"):
+            raise ValueError("absence_policy must be block or fallback")
+        self.absence_policy = absence_policy
         dy = _load("countyolo_density_yolo", os.path.join(countyolo_dir, "models", "density_yolo.py"))
         self._tiled = _load("countyolo_scale_zoom", os.path.join(countyolo_dir, "utils", "scale_zoom.py")) \
             .density_tiled_count
@@ -40,14 +46,18 @@ class CountYOLOStage1:
         if sam3_weights and kf_every > 0:
             self.sam3 = _load("countyolo_sam3_counter", os.path.join(countyolo_dir, "engines", "sam3_counter.py"))                 .SAM3Counter(sam3_weights, conf=sam3_conf)
         self.calls, self.protos, self.present, self.kf_log = 0, None, True, []
+        self.fusion, self.yolo_conf = fusion, yolo_conf
+        self.key_boxes, self.key_scores = torch.zeros(0, 4), torch.zeros(0)
+        self._geometry = _load("countyolo_proposals", os.path.join(countyolo_dir, "countvid_ext", "proposals.py")) if fusion else None
         print(f"CountYOLO Stage 1: arch={self.model.arch}, epoch {ckpt.get('epoch')}, "
               f"ttn_thr={ttn_thr}, ttn_grid={ttn_grid}, min_mass={min_mass}, "
-              f"SAM 3 keyframe every {kf_every if self.sam3 else 0}", flush=True)
+              f"SAM 3 keyframe every {kf_every if self.sam3 else 0}, absence_policy={absence_policy}", flush=True)
 
     @torch.no_grad()
     def keyframe(self, image, text, size=640):
         """SAM 3 trên một frame -> cờ có mặt + prototype exemplar của CountYOLO tại tâm các box điểm cao nhất."""
         boxes, scores = self.sam3._detect(np.array(image), text)
+        self.key_boxes, self.key_scores = boxes, scores
         self.present = len(boxes) > 0
         self.protos = None
         if self.present:
@@ -61,15 +71,25 @@ class CountYOLOStage1:
     @torch.no_grad()
     def boxes(self, image, text):
         """PIL.Image (RGB) + text -> (box xyxy (N, 4) toạ độ ảnh gốc, score (N,), count)."""
-        if self.sam3 is not None and self.calls % self.kf_every == 0:
+        is_keyframe = self.sam3 is not None and (self.calls % self.kf_every == 0 or (self.fusion and not self.present))
+        if is_keyframe:
             self.keyframe(image, text)
         self.calls += 1
-        if not self.present:
+        if not self.present and self.absence_policy == "block":
             return torch.zeros(0, 4), torch.zeros(0), 0.0
         count, _, boxes, scores = self._tiled(self.model, image, text, self.device, count_thr=self.ttn_thr,
                                               grid=self.ttn_grid, return_boxes=True, min_mass=self.min_mass,
                                               protos=self.protos)
         w, h = image.size
+        if self.fusion:
+            # A second full-frame pass buys text-conditioned detector geometry.
+            x = TF.to_tensor(image.resize((640, 640)))[None].to(self.device)
+            dets, _ = self.model(x, [text], exemplar_protos=self.protos)
+            db, ds = self._geometry.decode_yolo(dets, w, h, conf=self.yolo_conf)
+            if is_keyframe:
+                db = torch.cat([self.key_boxes, db])
+                ds = torch.cat([1 + self.key_scores, ds])
+            boxes, scores = self._geometry.fuse_proposals(boxes, scores, db, ds)
         boxes[:, 0::2] = boxes[:, 0::2].clamp(0, w)
         boxes[:, 1::2] = boxes[:, 1::2].clamp(0, h)
         return boxes.float(), scores.float(), count
