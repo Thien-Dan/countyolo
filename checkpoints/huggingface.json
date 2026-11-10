@@ -1,0 +1,26 @@
+{
+  "repo_id": "ThienDan2705/countyolo-checkpoints",
+  "repo_type": "model",
+  "revision": "cdcaac20d5178be2c6d7209ed525428a72345a1b",
+  "private": true,
+  "files": [
+    {
+      "path": "checkpoints/density_head_best_vit_seed3_ep19_valmae21.44.pth",
+      "size": 2436523,
+      "md5": "ae23944a3fa7adcddc3fb281c4e6432b",
+      "sha256": "c63648067bd210ee9c50dcadb211c20e764ee64336d7bfd9ab483db218849edc"
+    },
+    {
+      "path": "checkpoints/density_head_best_vit_exmix2_ep20.pth",
+      "size": 2436587,
+      "md5": "2275b7752d8edfc449f9fd41fd157bef",
+      "sha256": "fd9f291485f4b3f03169ee76891b6230314eb418a4a7c09e14eba84f19c1df3a"
+    },
+    {
+      "path": "checkpoints/density_head_best_vit_exnoise.pth",
+      "size": 2436587,
+      "md5": "0b2509a400328cf981c06fad082214e4",
+      "sha256": "babbd0c14048a1e9c2a0112fff3a7f25cd572098af44b9da31ea5c8415ebebde"
+    }
+  ]
+}

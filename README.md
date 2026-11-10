@@ -76,7 +76,7 @@ countyolo/
 ├── countvid_ext/              # plugin cho CountVid: tiling + NMS Stage 1, CountYOLO làm Stage 1, đo CountGD
 ├── launchers/                 # đóng gói + đẩy kernel Kaggle
 ├── app/app.py                 # giao diện Gradio
-├── checkpoints/               # checkpoint head (chỉ bản tốt nhất được commit)
+├── checkpoints/               # checkpoint local và manifest Hugging Face
 ├── legacy/                    # code / cấu hình cũ (tầm nhìn v4, pipeline video YOLO-World + SAM 2 đầu tiên)
 ├── PROJECT_OVERVIEW.md        # tài liệu kỹ thuật + toàn bộ thí nghiệm
 └── train_kaggle.ipynb, notebooke7cc063adf.ipynb   # notebook Kaggle (giữ ở gốc để Kaggle đồng bộ GitHub)
@@ -159,3 +159,36 @@ Kaggle validation: Penguins1 count27 unchanged, peak allocation7.34 ->4.06GiB;
 Penguins2 previously OOM, now completed94 frames with count54/59 and peak7.10GiB.
 These are development diagnostics, not a claim of stability on all videos.
 Artifacts: experiments/sam3_memory_tasks.json and outputs/sam3_memory_tasks/.
+
+
+## Lưu checkpoint trên Hugging Face
+
+Ba checkpoint CountYOLO (`seed3`, `exmix2`, `exnoise`) được lưu trong model repo
+riêng tư [ThienDan2705/countyolo-checkpoints](https://huggingface.co/ThienDan2705/countyolo-checkpoints).
+Git lưu manifest `checkpoints/huggingface.json` chứa commit cố định, kích thước và
+SHA-256. Công cụ tải kiểm tra toàn bộ file trước khi thay checkpoint local.
+SAM3, CountGD và pretrained backbone không thuộc lần upload này.
+
+```powershell
+# Dùng môi trường local hiện có, không cần cài lại model
+.\.venv\Scripts\hf.exe auth login
+.\.venv\Scripts\python.exe tools/download_checkpoints.py
+```
+
+Tài khoản cần quyền đọc repo riêng tư; trên Kaggle dùng secret `HF_TOKEN` nếu tải
+trực tiếp từ Hugging Face. Không commit token. Script cũng chạy trong môi trường
+công cụ có `huggingface_hub`, không cần import PyTorch.
+
+Các bản trọng số local được giữ nguyên. File `.pth` được bỏ khỏi phiên bản Git mới;
+lịch sử Git vẫn giữ phiên bản cũ. Hugging Face quản lý phiên bản trọng số trực tiếp,
+không cần DVC hoặc Google Drive cho ba checkpoint này.
+
+Launcher Kaggle hiện vẫn dùng URL commit Git lịch sử cố định cho seed3 (có kiểm tra
+SHA-256) và dataset Kaggle riêng tư cho exnoise, nên không cần đổi job đang chạy.
+
+Khi cập nhật trọng số: upload lên repo riêng tư, kiểm tra bản tải lại, rồi cập nhật
+revision, size và SHA-256 trong manifest trước khi commit code.
+
+Ledger `experiments/*tasks.json` và `video_diagnostics.json` là trạng thái máy local,
+không commit. Lần đầu tạo queue bằng `tools/video_tasks.py --init` sau khi có dữ liệu;
+kết quả và giới hạn đánh giá được ghi trong `experiments/LOG.md`.

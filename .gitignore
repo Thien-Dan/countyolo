@@ -55,10 +55,7 @@ kaggle_run/
 kaggle_countvid_run/
 kaggle_bench_run/
 
-# --- Selected CountYOLO heads; migrate to DVC after remote verification ---
-!checkpoints/density_head_best_vit_seed3_ep19_valmae21.44.pth
-!checkpoints/density_head_best_vit_exnoise.pth
-!checkpoints/density_head_best_vit_exmix2_ep20.pth
+# --- Model weights: Hugging Face manifest is tracked; raw weights remain local ---
 checkpoints/countgd_box*
 
 # --- Môi trường ảo của dự án ---
@@ -77,3 +74,6 @@ experiments/*.lock
 experiments/video_tasks.json
 experiments/video_diagnostics.json
 experiments/sam3_memory_tasks.json
+
+# Local-only abandoned Drive/DVC setup (may contain OAuth credentials)
+.dvc/
