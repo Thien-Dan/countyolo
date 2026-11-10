@@ -1,6 +1,10 @@
 # Operational tools; install separately from the model/UI environment.
 kaggle==2.2.5
-dvc[gdrive]>=3,<4
+dvc[gdrive]==3.67.1
 numpy<2.3
 requests>=2.32
 six>=1.17
+# PyDrive2 requires pyOpenSSL<=24.2.1. Keep its cryptography/SSH peers compatible.
+pyOpenSSL==24.2.1
+cryptography>=43,<44
+asyncssh==2.19.0
