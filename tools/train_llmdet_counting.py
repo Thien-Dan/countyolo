@@ -41,7 +41,7 @@ def prepare_llmdet_sample(image: Image.Image, record: dict, short=800, flip=Fals
         if len(boxes):
             boxes[:, [0, 2]] = w - boxes[:, [2, 0]]
 
-    ratio = min(short / min(w, h), 1333 / max(w, h))
+    ratio = min(short / min(w, h), 1024 / max(w, h))
     nw, nh = round(w * ratio), round(h * ratio)
     image = image.resize((nw, nh), Image.Resampling.BILINEAR)
 
@@ -87,7 +87,8 @@ class LLMDetData:
         record = self.annotations[name]
         if name == '7171.jpg':
             record = dict(record, box_examples_coordinates=[])
-        short = random.choice([480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]) if augment else 800
+        # FSC147 images are only 384px tall; large upscaling wastes VRAM (T4 15GB OOM at 800).
+        short = random.choice([384, 448, 512, 576, 640]) if augment else 640
         sample = prepare_llmdet_sample(
             image, record, short=short, flip=augment and random.random() < 0.5, max_queries=self.max_queries)
         sample.update(name=name, prompt=self.classes[name])
@@ -122,9 +123,10 @@ def evaluate_llmdet(model: LLMDetCounting, dataset: LLMDetData, names, device: s
     for i, name in enumerate(names):
         sample = dataset.get(name, augment=False)
         prompt = 'elephant' if absent else sample['prompt']
-        boxes, logits = model(sample['pil_image'], prompt)
+        with torch.autocast('cuda', dtype=torch.float16, enabled=torch.cuda.is_available()):
+            boxes, logits = model(sample['pil_image'], prompt)
         boxes = boxes.float().cpu()
-        scores = logits.sigmoid().cpu()
+        scores = logits.float().sigmoid().cpu()
         scale = boxes.new_tensor([640.0, 640.0, 640.0, 640.0])
         xyxy = xywh_to_xyxy(boxes) * scale
         centers = ((xyxy[:, :2] + xyxy[:, 2:]) / 2.0).numpy()
@@ -152,7 +154,8 @@ def main():
     p.add_argument('--epochs', type=int, default=30)
     p.add_argument('--accumulate', type=int, default=4)
     p.add_argument('--lr', type=float, default=1e-4)
-    p.add_argument('--neg-weight', type=float, default=0.15)
+    p.add_argument('--neg-weight', type=float, default=0.0, help='Extra negative-prompt forward keeps a 2nd full graph; off by default (OOM on T4)')
+    p.add_argument('--no-amp', action='store_true', help='Disable fp16 autocast')
     p.add_argument('--neg-topk', type=int, default=32)
     p.add_argument('--dev-per-class', type=int, default=8)
     p.add_argument('--pilot-images', type=Path)
@@ -205,6 +208,8 @@ def main():
     criterion = CountingCriterion()
     optimizer = torch.optim.AdamW([p for _, p in trainable], lr=a.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+    use_amp = (device == 'cuda') and not a.no_amp
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
     if a.smoke:
         model.set_training(True)
@@ -246,24 +251,26 @@ def main():
             sample = train.get(name, augment=True)
             caption = sample['prompt'].strip().lower().rstrip('.') + '.'
             inputs = model.processor(images=sample['pil_image'], text=caption, return_tensors='pt').to(device)
-            st = model.forward_stages(
-                inputs['pixel_values'], inputs.get('pixel_mask'),
-                inputs['input_ids'], inputs['attention_mask'], inputs.get('token_type_ids'))
+            with torch.autocast('cuda', dtype=torch.float16, enabled=use_amp):
+                st = model.forward_stages(
+                    inputs['pixel_values'], inputs.get('pixel_mask'),
+                    inputs['input_ids'], inputs['attention_mask'], inputs.get('token_type_ids'))
             loss, _ = compute_7layer_loss(criterion, st, sample, device)
-            if a.neg_weight > 0 and (i % a.accumulate == 0) and len(train_vocab) > 1:
-                neg_p = random.choice([c for c in train_vocab if c != sample['prompt']])
-                _, neg_logits = model(sample['pil_image'], neg_p)
-                loss = loss + a.neg_weight * topk_negative_focal_loss(neg_logits, a.neg_topk)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f'Non-finite loss on {name}')
             group_start = (i // a.accumulate) * a.accumulate
             group_size = min(a.accumulate, len(names) - group_start)
-            (loss / group_size).backward()
+            scaler.scale(loss / group_size).backward()
             if (i + 1) % a.accumulate == 0 or i + 1 == len(names):
-                torch.nn.utils.clip_grad_norm_([p for _, p in trainable], 0.1, error_if_nonfinite=True)
-                optimizer.step()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_([p for _, p in trainable], 0.1)
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad(set_to_none=True)
             losses.append(float(loss.detach()))
+            del st, loss, inputs
+            if (i + 1) % 100 == 0:
+                torch.cuda.empty_cache()
             if (i + 1) % 100 == 0:
                 save(a.output / 'progress.json', dict(epoch=epoch, images=i + 1, total=len(names), mean_loss=float(np.mean(losses))))
                 print('train', epoch, i + 1, len(names), 'loss', round(float(np.mean(losses)), 4), flush=True)

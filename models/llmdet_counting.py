@@ -91,6 +91,10 @@ class LLMDetCounting(nn.Module):
         stage_logits = [lg[:, :seq_len] for lg in stage_logits]
         if enc_logits is not None:
             enc_logits = enc_logits[:, :seq_len]
+        stage_boxes = [b.float() for b in stage_boxes]
+        stage_logits = [lg.float() for lg in stage_logits]
+        enc_boxes = enc_boxes.float() if enc_boxes is not None else None
+        enc_logits = enc_logits.float() if enc_logits is not None else None
         return dict(
             boxes=stage_boxes[-1],
             logits=stage_logits[-1],
