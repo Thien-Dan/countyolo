@@ -21,11 +21,28 @@ from torch import nn
 from torch.nn import functional as F
 from torchvision.ops import roi_align
 from transformers import AutoProcessor, OmDetTurboForObjectDetection
-from transformers.models.omdet_turbo.modeling_omdet_turbo import (
-    _inverse_sigmoid,
-    _prepare_4d_attention_mask,
-    get_class_similarity,
-)
+
+
+def _inverse_sigmoid(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    x = x.clamp(min=0.0, max=1.0)
+    return torch.log(x.clamp(min=eps) / (1.0 - x).clamp(min=eps))
+
+
+def _make_4d_attn_mask(valid_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Convert 2D valid mask (B, L) [True=attend] to 4D additive mask (B, 1, L, L) [0 / -min]."""
+    bsz, seq_len = valid_mask.shape
+    expanded = valid_mask[:, None, None, :].expand(bsz, 1, seq_len, seq_len)
+    inverted = 1.0 - expanded.to(dtype)
+    return inverted.masked_fill(inverted.to(torch.bool), torch.finfo(dtype).min)
+
+
+def _class_similarity(distance_type: str, cls_feature: torch.Tensor, class_proj: torch.Tensor) -> torch.Tensor:
+    """Exact OmDet-Turbo cosine/dot similarity between queries (B, Q, D) and projected classes (B, D, K)."""
+    if distance_type == 'cosine':
+        a = cls_feature / cls_feature.norm(dim=2, keepdim=True).clamp_min(1e-12)
+        b = class_proj / class_proj.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        return (1.0 / 0.07) * torch.bmm(a, b)
+    return torch.bmm(cls_feature, class_proj)
 
 
 def build_omdet_class_list(target_prompt: str, vocabulary: list[str], max_classes: int = 8, rng=None):
@@ -303,7 +320,7 @@ class OmDetTurboCounting(nn.Module):
         fusion_size = attn_mask_len + task_features.shape[0]
         key_padding_mask = torch.zeros([batch_size, fusion_size], dtype=torch.bool, device=task_features.device)
         key_padding_mask[:, attn_mask_len:] = src_key_mask
-        attention_mask = _prepare_4d_attention_mask(~key_padding_mask, dtype=vision_features.dtype)
+        attention_mask = _make_4d_attn_mask(~key_padding_mask, dtype=vision_features.dtype)
 
         # Two-Stage Encoder Proposal Generation
         anchors, valid_mask = dec.generate_anchors(
@@ -313,7 +330,7 @@ class OmDetTurboCounting(nn.Module):
             torch.where(valid_mask, vision_features, torch.tensor(0.0, dtype=vision_features.dtype, device=vision_features.device))
         )
         enc_class_proj = dec.encoder_class_head(class_features).permute(1, 2, 0)
-        enc_text_logits = get_class_similarity(dec.class_distance_type, enc_vis_feats, enc_class_proj).float()
+        enc_text_logits = _class_similarity(dec.class_distance_type, enc_vis_feats, enc_class_proj).float()
         enc_vis_logits = self._visual_similarity_logits(enc_vis_feats, ex_256) if ex_256 is not None else None
 
         if ex_256 is not None and not use_text:
@@ -359,7 +376,7 @@ class OmDetTurboCounting(nn.Module):
             refined_bbox = torch.sigmoid(dec.decoder_bbox_head[i](hidden) + _inverse_sigmoid(reference_points))
             if dec.training or i == dec.decoder_num_layers - 1:
                 cls_proj_i = dec.decoder_class_head[i](class_features).permute(1, 2, 0)
-                t_logits_i = get_class_similarity(dec.class_distance_type, hidden, cls_proj_i).float()
+                t_logits_i = _class_similarity(dec.class_distance_type, hidden, cls_proj_i).float()
                 if ex_256 is not None:
                     v_logits_i = self._visual_similarity_logits(hidden, ex_256)
                     logits_i = v_logits_i if not use_text else torch.cat([t_logits_i, v_logits_i], dim=-1)
