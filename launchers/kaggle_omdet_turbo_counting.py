@@ -97,7 +97,7 @@ MODE_META = {
 
 
 def prepare(user='nadthien', mode='multimodal', model_id='omlab/omdet-turbo-swin-tiny-hf',
-            epochs=20, lr=3e-5, exemplar_lr=1.5e-4, max_classes=8, neg_class_weight=0.5,
+            epochs=20, lr=3e-5, exemplar_lr=2e-4, max_classes=8, neg_class_weight=0.5,
             tile_trigger=600, init_kernel=None, init_dataset=None):
     slug, purpose, use_exemplars = MODE_META[mode]
     folder = ROOT / 'kaggle_video_run' / user / slug
@@ -166,7 +166,7 @@ def main():
     p.add_argument('--model-id', default='omlab/omdet-turbo-swin-tiny-hf')
     p.add_argument('--epochs', type=int, default=20)
     p.add_argument('--lr', type=float, default=3e-5)
-    p.add_argument('--exemplar-lr', type=float, default=1.5e-4)
+    p.add_argument('--exemplar-lr', type=float, default=2e-4)
     p.add_argument('--max-classes', type=int, default=8)
     p.add_argument('--neg-class-weight', type=float, default=0.5)
     p.add_argument('--tile-trigger', type=int, default=600)

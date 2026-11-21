@@ -1,18 +1,18 @@
-"""OmDet-Turbo v2 (RT-DETR HybridEncoder + Frozen CLIP Space + Class-Agnostic Visual Exemplar Matching)
+"""OmDet-Turbo v2.1 (RT-DETR HybridEncoder + Frozen CLIP Space + Same-Space Class-Agnostic Visual Matching)
 for real-time NMS-free Open-World Counting (CountVid Stage 1).
 
-Key upgrades in v2 to eliminate 89-class FSC-147 train overfitting and unlock unseen-class counting:
-1. Freeze all 7 CLIP class projection heads (`encoder_class_head` + `decoder_class_head[0..5]`)
-   so open-vocabulary CLIP semantic geometry is preserved 100% on unseen classes.
-2. Class-Agnostic Direct Visual Matching in 256-d query space:
-   - Multi-scale Spatial Similarity Map (`[max_sim, mean_sim]` on P3/P4/P5) fused into vision
-     features BEFORE Two-Stage Encoder Query Selection.
-   - Direct Visual Cosine Head (`scale * cosine(vis_query_head(q), vis_ex_head(ex)) + bias`)
-     participating in BOTH Two-Stage Encoder Query Selection and all 6 Decoder stages.
-   - Individual exemplar tokens concatenated into `task_features` for 6-layer Decoder Self-Attention.
-3. Three-mode training/inference (`text_only`, `exemplar_only`, `multimodal`) so 33% Exemplar-Only
-   steps (prompt = "object") force pure class-agnostic visual matching that transfers zero-shot.
-4. Pure FP32 visual-matching & ROIAlign ops, FrozenBN for `batch_size=1`, and detached CLIP LRU cache.
+Fixes in v2.1 (verified from Epoch 1-3 diagnostics):
+1. Same-Space Multi-Scale Spatial Similarity:
+   - `sim_raw_l = cosine(encoder_states[l], roi_align(encoder_states[l], boxes))` (100% same pretrained
+     feature space -> lights up matching objects at ~0.9-1.0 from Step 0 on unseen classes!).
+   - `sim_learned = cosine(fused, roi_align(fused, boxes))` (100% same `exemplar_proj` space!).
+   - Feeds 4-channel `[raw_max, raw_mean, learned_max, learned_mean]` into `sim_fusion_convs[l]`.
+2. Residual Identity-Preserving Visual Matching Heads (`vis_query_head`, `vis_ex_head`) so pretrained
+   object features are preserved from Step 0 instead of scrambled by random linear layers.
+3. Separate parameter groups & separate gradient clipping (`det_params`, `ex_params`, and dedicated
+   calibration group for `vis_logit_scale`/`vis_logit_bias` with `weight_decay=0.0`) so global clipping
+   never chokes `vbias` or visual-matching gradients.
+4. Frozen 7 CLIP class heads + FrozenBN + detached CLIP LRU cache + Pure FP32 visual ops.
 """
 import math
 import random
@@ -45,6 +45,20 @@ def _class_similarity(distance_type: str, cls_feature: torch.Tensor, class_proj:
     return torch.bmm(cls_feature, class_proj)
 
 
+class ResidualProj(nn.Module):
+    """Identity-preserving residual projection: LayerNorm(x + Linear(GELU(Linear(x)))) initialized near identity."""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim)
+        self.fc2 = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
+        nn.init.normal_(self.fc2.weight, std=0.02)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x + self.fc2(F.gelu(self.fc1(x))))
+
+
 def build_omdet_class_list(target_prompt: str, vocabulary: list[str], max_classes: int = 8, rng=None):
     """Build a shuffled class list `[c0, ..., c_{K-1}]`, task string, and `target_idx`."""
     norm = lambda s: s.strip().lower().rstrip('.')
@@ -65,7 +79,7 @@ def build_omdet_class_list(target_prompt: str, vocabulary: list[str], max_classe
 
 
 class OmDetTurboCounting(nn.Module):
-    ARCHITECTURE = 'omdet-turbo-countgd-box-7layer-v2-class-agnostic'
+    ARCHITECTURE = 'omdet-turbo-countgd-box-7layer-v2.1-same-space'
 
     def __init__(self, model_id='omlab/omdet-turbo-swin-tiny-hf', device='cuda',
                  freeze_backbones=True, freeze_class_heads=True, use_exemplars=False,
@@ -85,7 +99,6 @@ class OmDetTurboCounting(nn.Module):
             self.detector.vision_backbone.requires_grad_(False)
             self.detector.language_backbone.requires_grad_(False)
         if self.freeze_class_heads:
-            # Freeze all 7 CLIP->256 class projection heads to prevent overfitting the 89 FSC-147 train classes
             self.detector.decoder.encoder_class_head.requires_grad_(False)
             self.detector.decoder.decoder_class_head.requires_grad_(False)
 
@@ -105,10 +118,10 @@ class OmDetTurboCounting(nn.Module):
                 nn.Conv2d(self.d_model, self.d_model, kernel_size=1),
             ).to(device).float()
 
-            # Spatial similarity fusion maps ([max_sim, mean_sim] -> encoder_dim residual) per FPN level
+            # 4-channel Same-Space Spatial Sim-Map: [raw_max, raw_mean, learned_max, learned_mean]
             self.sim_fusion_convs = nn.ModuleList([
                 nn.Sequential(
-                    nn.Conv2d(2, self.encoder_dim, kernel_size=1),
+                    nn.Conv2d(4, self.encoder_dim, kernel_size=1),
                     nn.GroupNorm(gn_groups, self.encoder_dim),
                     nn.SiLU(inplace=True),
                     nn.Conv2d(self.encoder_dim, self.encoder_dim, kernel_size=1),
@@ -116,10 +129,9 @@ class OmDetTurboCounting(nn.Module):
                 for _ in range(self.num_levels)
             ]).to(device).float()
             for block in self.sim_fusion_convs:
-                nn.init.normal_(block[-1].weight, std=0.01)
+                nn.init.normal_(block[-1].weight, std=0.02)
                 nn.init.zeros_(block[-1].bias)
 
-            # Task-prompt exemplar tokens for 6-layer Decoder Joint Self-Attention
             self.exemplar_to_task = nn.Sequential(
                 nn.Linear(self.d_model, self.class_embed_dim),
                 nn.LayerNorm(self.class_embed_dim),
@@ -129,15 +141,9 @@ class OmDetTurboCounting(nn.Module):
             )
             nn.init.normal_(self.exemplar_task_embed, std=0.02)
 
-            # Direct Class-Agnostic Visual Matching heads in 256-d query space
-            self.vis_query_head = nn.Sequential(
-                nn.Linear(self.d_model, self.d_model),
-                nn.LayerNorm(self.d_model),
-            ).to(device).float()
-            self.vis_ex_head = nn.Sequential(
-                nn.Linear(self.d_model, self.d_model),
-                nn.LayerNorm(self.d_model),
-            ).to(device).float()
+            # Identity-preserving residual visual matching heads in 256-d query space
+            self.vis_query_head = ResidualProj(self.d_model).to(device).float()
+            self.vis_ex_head = ResidualProj(self.d_model).to(device).float()
             self.vis_logit_scale = nn.Parameter(torch.tensor([math.log(10.0)], device=device, dtype=torch.float32))
             self.vis_logit_bias = nn.Parameter(torch.tensor([-3.0], device=device, dtype=torch.float32))
         else:
@@ -166,7 +172,6 @@ class OmDetTurboCounting(nn.Module):
         if self.freeze_class_heads:
             self.detector.decoder.encoder_class_head.eval()
             self.detector.decoder.decoder_class_head.eval()
-        # Freeze BatchNorm2d running stats during batch_size=1 training
         for module in self.detector.modules():
             if isinstance(module, nn.BatchNorm2d):
                 module.eval()
@@ -193,85 +198,121 @@ class OmDetTurboCounting(nn.Module):
         params.extend(self._exemplar_named_parameters())
         return params
 
-    def parameter_groups(self, base_lr=3e-5, exemplar_lr=1.5e-4, weight_decay=1e-4):
+    def parameter_buckets(self):
+        """Return `(det_params, ex_body_params, cal_params)` for independent gradient clipping & LRs."""
         det_params = [p for _, p in self.detector.named_parameters() if p.requires_grad]
+        if self.exemplar_proj is None:
+            return det_params, [], []
+        ex_body = []
+        for mod in (self.exemplar_proj, self.sim_fusion_convs, self.exemplar_to_task,
+                    self.vis_query_head, self.vis_ex_head):
+            ex_body.extend([p for p in mod.parameters() if p.requires_grad])
+        ex_body.append(self.exemplar_task_embed)
+        cal_params = [self.vis_logit_scale, self.vis_logit_bias]
+        return det_params, ex_body, cal_params
+
+    def parameter_groups(self, base_lr=3e-5, exemplar_lr=2e-4, cal_lr=2e-3, weight_decay=1e-4):
+        det_params, ex_body, cal_params = self.parameter_buckets()
         groups = [dict(params=det_params, lr=base_lr, weight_decay=weight_decay)]
-        ex_params = [p for _, p in self._exemplar_named_parameters()]
-        if ex_params:
-            groups.append(dict(params=ex_params, lr=exemplar_lr, weight_decay=weight_decay))
+        if ex_body:
+            groups.append(dict(params=ex_body, lr=exemplar_lr, weight_decay=weight_decay))
+        if cal_params:
+            groups.append(dict(params=cal_params, lr=cal_lr, weight_decay=0.0))
         return groups
 
-    def _extract_exemplar_256(self, encoder_states, exemplar_boxes):
-        """Extract (E, d_model) exemplar features via pure FP32 ROIAlign(1x1) on fused (P3, P4, P5)."""
-        with torch.autocast(device_type='cuda', enabled=False):
-            p3 = encoder_states[0].float()
-            h0, w0 = p3.shape[-2:]
-            p4 = (encoder_states[1] if len(encoder_states) > 1 else p3).float()
-            p5 = (encoder_states[2] if len(encoder_states) > 2 else p4).float()
-            fused = torch.cat([
-                p3,
-                F.interpolate(p4, size=(h0, w0), mode='bilinear', align_corners=False),
-                F.interpolate(p5, size=(h0, w0), mode='bilinear', align_corners=False),
-            ], dim=1)
-            fused = self.exemplar_proj(fused)
-            boxes = exemplar_boxes.to(device=fused.device, dtype=torch.float32)
-            scaled = torch.stack([
-                (boxes[:, 0] * float(w0)).clamp(0.0, float(w0)),
-                (boxes[:, 1] * float(h0)).clamp(0.0, float(h0)),
-                (boxes[:, 2] * float(w0)).clamp(0.0, float(w0)),
-                (boxes[:, 3] * float(h0)).clamp(0.0, float(h0)),
-            ], dim=-1)
-            pooled = roi_align(fused, [scaled], output_size=(1, 1), aligned=True).flatten(1)  # (E, d_model)
-        return pooled
+    def _build_fused_map(self, encoder_states):
+        p3 = encoder_states[0].float()
+        h0, w0 = p3.shape[-2:]
+        p4 = (encoder_states[1] if len(encoder_states) > 1 else p3).float()
+        p5 = (encoder_states[2] if len(encoder_states) > 2 else p4).float()
+        fused = torch.cat([
+            p3,
+            F.interpolate(p4, size=(h0, w0), mode='bilinear', align_corners=False),
+            F.interpolate(p5, size=(h0, w0), mode='bilinear', align_corners=False),
+        ], dim=1)
+        return self.exemplar_proj(fused)
 
-    def _enhance_states_with_sim(self, encoder_states, ex_256):
-        """Inject multi-scale [max_sim, mean_sim] visual similarity maps into (P3, P4, P5) in FP32."""
+    @staticmethod
+    def _roi_pool_level(feat_map: torch.Tensor, exemplar_boxes: torch.Tensor) -> torch.Tensor:
+        h, w = feat_map.shape[-2:]
+        boxes = exemplar_boxes.to(device=feat_map.device, dtype=torch.float32)
+        scaled = torch.stack([
+            (boxes[:, 0] * float(w)).clamp(0.0, float(w)),
+            (boxes[:, 1] * float(h)).clamp(0.0, float(h)),
+            (boxes[:, 2] * float(w)).clamp(0.0, float(w)),
+            (boxes[:, 3] * float(h)).clamp(0.0, float(h)),
+        ], dim=-1)
+        return roi_align(feat_map, [scaled], output_size=(1, 1), aligned=True).flatten(1)
+
+    def _extract_exemplar_bundle(self, encoder_states, exemplar_boxes):
+        """Extract SAME-SPACE multi-scale raw exemplars + learned fused exemplars in pure FP32."""
+        with torch.autocast(device_type='cuda', enabled=False):
+            fused = self._build_fused_map(encoder_states)
+            ex_256 = self._roi_pool_level(fused, exemplar_boxes)
+            ex_raw_levels = [self._roi_pool_level(feat.float(), exemplar_boxes) for feat in encoder_states]
+        return dict(ex_256=ex_256, ex_raw_levels=ex_raw_levels, fused=fused)
+
+    def _enhance_states_with_sim(self, encoder_states, bundle):
+        """Compute SAME-SPACE raw + learned similarity maps and fuse into (P3, P4, P5) in FP32."""
         orig_dtype = encoder_states[0].dtype
         enhanced = []
         with torch.autocast(device_type='cuda', enabled=False):
-            ex_norm = F.normalize(ex_256.float(), dim=-1, eps=1e-6)  # (E, D)
+            fused = bundle.get('fused')
+            if fused is None:
+                fused = self._build_fused_map(encoder_states)
+            ex_256 = bundle['ex_256'].to(device=fused.device, dtype=torch.float32)
+            ex_learned_norm = F.normalize(ex_256, dim=-1, eps=1e-6)
+            fused_norm = F.normalize(fused, dim=1, eps=1e-6)
+            sim_learned = torch.einsum('bchw,ec->behw', fused_norm, ex_learned_norm)
+            learned_stats_0 = torch.cat([
+                sim_learned.max(dim=1, keepdim=True).values,
+                sim_learned.mean(dim=1, keepdim=True),
+            ], dim=1)  # (1, 2, H0, W0)
+
             for lvl, feat in enumerate(encoder_states):
-                f = feat.float()  # (1, D, H, W)
-                f_norm = F.normalize(f, dim=1, eps=1e-6)
-                sim = torch.einsum('bchw,ec->behw', f_norm, ex_norm)  # (1, E, H, W)
-                sim_stats = torch.cat([
-                    sim.max(dim=1, keepdim=True).values,
-                    sim.mean(dim=1, keepdim=True),
-                ], dim=1)  # (1, 2, H, W)
-                delta = self.sim_fusion_convs[lvl](sim_stats)
+                f = feat.float()
+                ex_raw = bundle['ex_raw_levels'][lvl].to(device=f.device, dtype=torch.float32)
+                sim_raw = torch.einsum(
+                    'bchw,ec->behw',
+                    F.normalize(f, dim=1, eps=1e-6),
+                    F.normalize(ex_raw, dim=-1, eps=1e-6),
+                )
+                raw_stats = torch.cat([
+                    sim_raw.max(dim=1, keepdim=True).values,
+                    sim_raw.mean(dim=1, keepdim=True),
+                ], dim=1)
+                learned_stats = F.interpolate(learned_stats_0, size=f.shape[-2:], mode='bilinear', align_corners=False)
+                sim_4ch = torch.cat([raw_stats, learned_stats], dim=1)  # (1, 4, H_l, W_l)
+                delta = self.sim_fusion_convs[lvl](sim_4ch)
                 enhanced.append((f + delta).to(orig_dtype))
         return enhanced
 
     def _visual_similarity_logits(self, query_feats, ex_256):
         """Compute direct class-agnostic visual similarity logits (B, Q, E) in pure FP32."""
         with torch.autocast(device_type='cuda', enabled=False):
-            q = F.normalize(self.vis_query_head(query_feats.float()), dim=-1, eps=1e-6)  # (B, Q, D)
-            e = F.normalize(self.vis_ex_head(ex_256.float()), dim=-1, eps=1e-6)          # (E, D)
+            q = F.normalize(self.vis_query_head(query_feats.float()), dim=-1, eps=1e-6)
+            e = F.normalize(self.vis_ex_head(ex_256.float()), dim=-1, eps=1e-6)
             scale = self.vis_logit_scale.exp().clamp(1.0, 25.0)
             logits = scale * torch.einsum('bqd,ed->bqe', q, e) + self.vis_logit_bias
         return logits
 
     @torch.no_grad()
     def encode_exemplars(self, pil_image, exemplar_boxes):
-        """Precompute (E, d_model) visual exemplar embeddings from full image for 2x2 tiling."""
+        """Precompute same-space exemplar bundle from full image for 2x2 tiling."""
         if not self.use_exemplars or exemplar_boxes is None or len(exemplar_boxes) == 0:
             return None
         inputs = self.processor(images=pil_image, text=['object'], task='Detect object.', return_tensors='pt').to(self.device)
         image_features = self.detector.vision_backbone(inputs['pixel_values'])
         enc_out = self.detector.encoder(image_features, return_dict=True)
-        return self._extract_exemplar_256(enc_out.extracted_states, exemplar_boxes)
+        bundle = self._extract_exemplar_bundle(enc_out.extracted_states, exemplar_boxes)
+        # Drop full-image `fused` map so sub-tiles compute their own `fused` map in same space
+        return dict(ex_256=bundle['ex_256'], ex_raw_levels=bundle['ex_raw_levels'])
 
     def forward_stages(self, pixel_values, classes_input_ids, classes_attention_mask,
                        tasks_input_ids, tasks_attention_mask, classes_structure,
                        target_idx: int = 0, exemplar_boxes=None, exemplar_feats=None,
                        use_text: bool = True):
-        """Run OmDet-Turbo v2 forward returning differentiable 7-stage boxes/logits.
-
-        Modes:
-        - `use_text=True, exemplar_boxes=None`: Text-Only (frozen CLIP cosine logits over K classes).
-        - `use_text=False, exemplar_boxes!=None`: Exemplar-Only (pure class-agnostic visual logits over E exemplars).
-        - `use_text=True, exemplar_boxes!=None`: Multimodal (unified [K text logits, E visual logits]).
-        """
+        """Run OmDet-Turbo v2.1 forward returning differentiable 7-stage boxes/logits."""
         dec = self.detector.decoder
         with torch.no_grad():
             image_features = self.detector.vision_backbone(pixel_values)
@@ -291,25 +332,26 @@ class OmDetTurboCounting(nn.Module):
         num_classes = int(class_features.shape[0])
         t_idx = min(max(0, int(target_idx)), num_classes - 1)
 
-        ex_256 = None
+        bundle = None
         if self.use_exemplars:
-            if exemplar_feats is not None and len(exemplar_feats) > 0:
-                ex_256 = exemplar_feats.to(device=pixel_values.device, dtype=torch.float32)
+            if exemplar_feats is not None:
+                bundle = exemplar_feats
             elif exemplar_boxes is not None and len(exemplar_boxes) > 0:
-                ex_256 = self._extract_exemplar_256(extracted_states, exemplar_boxes)
+                bundle = self._extract_exemplar_bundle(extracted_states, exemplar_boxes)
 
-        if ex_256 is not None:
-            # 1) Spatial similarity injection BEFORE Two-Stage Encoder Query Selection
-            extracted_states = self._enhance_states_with_sim(extracted_states, ex_256)
+        ex_256 = None
+        if bundle is not None:
+            ex_256 = bundle['ex_256'].to(device=pixel_values.device, dtype=torch.float32)
+            # 1) Same-Space Multi-Scale Spatial Similarity injection BEFORE Two-Stage Query Selection
+            extracted_states = self._enhance_states_with_sim(extracted_states, bundle)
             # 2) Append individual visual exemplar tokens to task_features for 6-layer Decoder Self-Attention
             with torch.autocast(device_type='cuda', enabled=False):
-                ex_task = self.exemplar_to_task(ex_256).unsqueeze(1) + self.exemplar_task_embed  # (E, 1, C)
+                ex_task = self.exemplar_to_task(ex_256).unsqueeze(1) + self.exemplar_task_embed
             ex_task = ex_task.to(task_features.dtype)
             ex_mask = torch.ones((task_mask.shape[0], ex_task.shape[0]), dtype=task_mask.dtype, device=task_mask.device)
             task_features = torch.cat([task_features, ex_task], dim=0)
             task_mask = torch.cat([task_mask, ex_mask], dim=1)
 
-        # ---- Run OmDetTurboDecoder with unified Text + Class-Agnostic Visual Matching ----
         vision_features, vision_shapes, vision_shapes_list, level_start_index = dec._get_encoder_input(extracted_states)
         batch_size = task_mask.shape[0]
         task_features = dec.task_encoder(task_features)
@@ -345,7 +387,7 @@ class OmDetTurboCounting(nn.Module):
         batch_ind = torch.arange(end=batch_size, dtype=topk_ind.dtype, device=topk_ind.device).unsqueeze(-1).repeat(1, dec.num_queries).view(-1)
 
         ref_raw = enc_outputs_bboxes[batch_ind, topk_ind].view(batch_size, dec.num_queries, -1)
-        enc_boxes = ref_raw.sigmoid()[0].float()  # differentiable!
+        enc_boxes = ref_raw.sigmoid()[0].float()
         enc_logits = enc_all_logits[batch_ind, topk_ind].view(batch_size, dec.num_queries, -1)[0].float()
 
         reference_points = ref_raw.detach().sigmoid() if dec.training else ref_raw.sigmoid()
@@ -391,7 +433,6 @@ class OmDetTurboCounting(nn.Module):
             last_refined_bbox = refined_bbox
             reference_points = refined_bbox.detach() if dec.training else refined_bbox
 
-        # Build exact target_tokens mask matching active columns
         if ex_256 is not None and not use_text:
             target_tokens = torch.ones(len(ex_256), dtype=torch.bool, device=pixel_values.device)
         elif ex_256 is not None and use_text:

@@ -213,7 +213,8 @@ def main():
     p.add_argument('--epochs', type=int, default=20)
     p.add_argument('--accumulate', type=int, default=4)
     p.add_argument('--lr', type=float, default=3e-5, help='Gentle LR for pretrained OmDet-Turbo encoder/decoder')
-    p.add_argument('--exemplar-lr', type=float, default=1.5e-4, help='Higher LR for newly initialized visual matching heads')
+    p.add_argument('--exemplar-lr', type=float, default=2e-4, help='Higher LR for newly initialized visual matching heads')
+    p.add_argument('--cal-lr', type=float, default=2e-3, help='Dedicated LR for vis_logit_scale / vis_logit_bias calibration')
     p.add_argument('--max-classes', type=int, default=8, help='Classes per forward when text is active')
     p.add_argument('--neg-class-weight', type=float, default=0.5, help='Balanced negative weight on non-target CLIP classes')
     p.add_argument('--use-exemplars', action='store_true', help='Enable Class-Agnostic Visual Exemplar Matching')
@@ -314,11 +315,22 @@ def main():
         return
 
     criterion = CountingCriterion()
-    optimizer = torch.optim.AdamW(model.parameter_groups(base_lr=a.lr, exemplar_lr=a.exemplar_lr, weight_decay=1e-4))
+    det_params, ex_body_params, cal_params = model.parameter_buckets()
+    optimizer = torch.optim.AdamW(model.parameter_groups(
+        base_lr=a.lr, exemplar_lr=a.exemplar_lr, cal_lr=a.cal_lr, weight_decay=1e-4))
     steps_per_epoch = math.ceil(len(train.names) / a.accumulate)
     scheduler = make_warmup_cosine_scheduler(optimizer, total_steps=a.epochs * steps_per_epoch, warmup_steps=min(450, steps_per_epoch // 2))
     use_amp = (device == 'cuda') and not a.no_amp
     scaler = torch.amp.GradScaler('cuda', init_scale=256.0, enabled=use_amp)
+
+    def clip_all_buckets():
+        # Independent gradient clipping per bucket so 25M pretrained params never choke new exemplar/calibration heads!
+        if det_params:
+            torch.nn.utils.clip_grad_norm_(det_params, 1.0)
+        if ex_body_params:
+            torch.nn.utils.clip_grad_norm_(ex_body_params, 1.0)
+        if cal_params:
+            torch.nn.utils.clip_grad_norm_(cal_params, 1.0)
 
     if a.smoke:
         model.set_training(True)
@@ -368,8 +380,8 @@ def main():
             assert math.isfinite(vq_g) and vq_g > 0, f'vis_query_head bad grad: {vq_g}'
             assert math.isfinite(ve_g) and ve_g > 0, f'vis_ex_head bad grad: {ve_g}'
             ex_msg = f' ex_proj={ex_p_g:.4f} sim={sim_g:.4f} vis_q={vq_g:.4f} vis_e={ve_g:.4f}'
-        print(f'omdet v2 smoke grad sums: enc={enc_g:.4f} enc_bbox={enc_b_g:.4f} dec_bbox={dec_b_g:.4f}{ex_msg}', flush=True)
-        torch.nn.utils.clip_grad_norm_([p for _, p in trainable], 0.1)
+        print(f'omdet v2.1 smoke grad sums: enc={enc_g:.4f} enc_bbox={enc_b_g:.4f} dec_bbox={dec_b_g:.4f}{ex_msg}', flush=True)
+        clip_all_buckets()
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
@@ -434,7 +446,7 @@ def main():
             scaler.scale(loss / group_size).backward()
             if (i + 1) % a.accumulate == 0 or i + 1 == len(names):
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_([p for _, p in trainable], 0.1)
+                clip_all_buckets()
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
