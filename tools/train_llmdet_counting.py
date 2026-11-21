@@ -317,7 +317,7 @@ def main():
     steps_per_epoch = math.ceil(len(train.names) / a.accumulate)
     scheduler = make_warmup_cosine_scheduler(optimizer, total_steps=a.epochs * steps_per_epoch, warmup_steps=min(450, steps_per_epoch // 2))
     use_amp = (device == 'cuda') and not a.no_amp
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    scaler = torch.amp.GradScaler('cuda', init_scale=256.0, enabled=use_amp)
 
     if a.smoke:
         model.set_training(True)
@@ -343,7 +343,8 @@ def main():
         assert enc_g > 0, f'encoder_output_bbox_embed bad grad sum: {enc_g}'
         if a.use_exemplars:
             ex_g = sum(p.grad.abs().sum().item() for p in model.exemplar_proj.parameters() if p.grad is not None)
-            assert ex_g > 0, f'exemplar_proj bad grad sum: {ex_g} (norm_g={model.exemplar_type_embed.grad.abs().sum().item() if model.exemplar_type_embed.grad is not None else None})'
+            assert math.isfinite(ex_g) and ex_g > 0, f'exemplar_proj bad grad sum: {ex_g} (norm_g={model.exemplar_type_embed.grad.abs().sum().item() if model.exemplar_type_embed.grad is not None else None})'
+        print(f'smoke grad sums: bbox={bbox_g:.4f} enc_bbox={enc_g:.4f}' + (f' ex_proj={ex_g:.4f}' if a.use_exemplars else ''), flush=True)
         torch.nn.utils.clip_grad_norm_([p for _, p in trainable], 0.1)
         scaler.step(optimizer)
         scaler.update()
