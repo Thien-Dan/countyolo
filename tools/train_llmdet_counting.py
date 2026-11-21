@@ -336,11 +336,14 @@ def main():
             assert torch.isfinite(loss)
             scaler.scale(loss / 2.0).backward()
         # Verify real gradient flow to BOTH decoder bbox_embed AND encoder proposal heads!
-        assert any(p.grad is not None and p.grad.abs().sum().item() > 0 for p in model.detector.bbox_embed.parameters()), 'bbox_embed received zero grad'
-        assert any(p.grad is not None and p.grad.abs().sum().item() > 0 for p in model.detector.model.encoder_output_bbox_embed.parameters()), 'encoder_output_bbox_embed received zero grad'
-        if a.use_exemplars:
-            assert any(p.grad is not None and p.grad.abs().sum().item() > 0 for p in model.exemplar_proj.parameters()), 'exemplar_proj received zero grad'
         scaler.unscale_(optimizer)
+        bbox_g = sum(p.grad.abs().sum().item() for p in model.detector.bbox_embed.parameters() if p.grad is not None)
+        enc_g = sum(p.grad.abs().sum().item() for p in model.detector.model.encoder_output_bbox_embed.parameters() if p.grad is not None)
+        assert bbox_g > 0, f'bbox_embed bad grad sum: {bbox_g}'
+        assert enc_g > 0, f'encoder_output_bbox_embed bad grad sum: {enc_g}'
+        if a.use_exemplars:
+            ex_g = sum(p.grad.abs().sum().item() for p in model.exemplar_proj.parameters() if p.grad is not None)
+            assert ex_g > 0, f'exemplar_proj bad grad sum: {ex_g} (norm_g={model.exemplar_type_embed.grad.abs().sum().item() if model.exemplar_type_embed.grad is not None else None})'
         torch.nn.utils.clip_grad_norm_([p for _, p in trainable], 0.1)
         scaler.step(optimizer)
         scaler.update()

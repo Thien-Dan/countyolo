@@ -207,30 +207,35 @@ class LLMDetCounting(nn.Module):
         return feature_maps, masks, position_embeddings_list, pixel_mask
 
     def _extract_exemplar_tokens(self, feature_maps, masks, exemplar_boxes):
-        """Extract (1, E, d_model) normalized exemplar tokens via ROIAlign(1x1) using Swin valid_ratios."""
+        """Extract (1, E, d_model) normalized exemplar tokens via FP32 ROIAlign(1x1) using Swin valid_ratios."""
         m = self.detector.model
-        h0, w0 = feature_maps[0].shape[-2:]
-        lvl1 = feature_maps[1] if len(feature_maps) > 1 else feature_maps[0]
-        lvl2 = feature_maps[2] if len(feature_maps) > 2 else lvl1
-        fused = torch.cat([
-            feature_maps[0],
-            F.interpolate(lvl1, size=(h0, w0), mode='bilinear', align_corners=False),
-            F.interpolate(lvl2, size=(h0, w0), mode='bilinear', align_corners=False),
-        ], dim=1)
-        fused = self.exemplar_proj(fused)
-        valid_ratio = m.get_valid_ratio(masks[0])[0]  # [valid_w_ratio, valid_h_ratio]
-        sx = float(w0) * float(valid_ratio[0].item())
-        sy = float(h0) * float(valid_ratio[1].item())
-        boxes = exemplar_boxes.to(device=fused.device, dtype=torch.float32)
-        scaled = torch.stack([
-            (boxes[:, 0] * sx).clamp(0.0, float(w0)),
-            (boxes[:, 1] * sy).clamp(0.0, float(h0)),
-            (boxes[:, 2] * sx).clamp(0.0, float(w0)),
-            (boxes[:, 3] * sy).clamp(0.0, float(h0)),
-        ], dim=-1)
-        pooled = roi_align(fused.float(), [scaled], output_size=(1, 1), aligned=True).flatten(1).unsqueeze(0)
-        tokens = self.exemplar_norm(pooled) + self.exemplar_type_embed
-        return tokens.to(fused.dtype)
+        orig_dtype = feature_maps[0].dtype
+        with torch.autocast(device_type='cuda', enabled=False):
+            f0 = feature_maps[0].float()
+            h0, w0 = f0.shape[-2:]
+            lvl1 = (feature_maps[1] if len(feature_maps) > 1 else feature_maps[0]).float()
+            lvl2 = (feature_maps[2] if len(feature_maps) > 2 else lvl1).float()
+            fused = torch.cat([
+                f0,
+                F.interpolate(lvl1, size=(h0, w0), mode='bilinear', align_corners=False),
+                F.interpolate(lvl2, size=(h0, w0), mode='bilinear', align_corners=False),
+            ], dim=1)
+            fused = self.exemplar_proj(fused)
+            valid_ratio = m.get_valid_ratio(masks[0])[0]  # [valid_w_ratio, valid_h_ratio]
+            vx = float(valid_ratio[0].item())
+            vy = float(valid_ratio[1].item())
+            sx = float(w0) * (vx if vx > 0.0 else 1.0)
+            sy = float(h0) * (vy if vy > 0.0 else 1.0)
+            boxes = exemplar_boxes.to(device=fused.device, dtype=torch.float32)
+            scaled = torch.stack([
+                (boxes[:, 0] * sx).clamp(0.0, float(w0)),
+                (boxes[:, 1] * sy).clamp(0.0, float(h0)),
+                (boxes[:, 2] * sx).clamp(0.0, float(w0)),
+                (boxes[:, 3] * sy).clamp(0.0, float(h0)),
+            ], dim=-1)
+            pooled = roi_align(fused, [scaled], output_size=(1, 1), aligned=True).flatten(1).unsqueeze(0)
+            tokens = self.exemplar_norm(pooled) + self.exemplar_type_embed
+        return tokens.to(orig_dtype)
 
     @torch.no_grad()
     def encode_exemplars(self, pil_image, exemplar_boxes):
