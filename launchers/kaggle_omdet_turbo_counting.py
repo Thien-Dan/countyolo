@@ -1,4 +1,4 @@
-"""Package and submit OmDet-Turbo v2 counting experiments (eval / text / multimodal) to Kaggle."""
+"""Package and submit OmDet-Turbo v3 counting experiments (eval / text / multimodal) to Kaggle."""
 import argparse
 import base64
 from datetime import datetime, timezone
@@ -63,13 +63,13 @@ try:
         run([sys.executable,'-u','tools/train_omdet_turbo_counting.py',*common,
             '--output',W/'omdet_eval','--eval-only'])
     else:
+        lr_args=['--backbone-lr',str(SPEC['backbone_lr']),'--lr',str(SPEC['lr']),
+                 '--fusion-lr',str(SPEC['fusion_lr']),'--cal-lr',str(SPEC['cal_lr'])]
         status('gradient_smoke')
-        run([sys.executable,'-u','tools/train_omdet_turbo_counting.py',*common,
-            '--lr',str(SPEC['lr']),'--exemplar-lr',str(SPEC['exemplar_lr']),
+        run([sys.executable,'-u','tools/train_omdet_turbo_counting.py',*common,*lr_args,
             '--output',W/'gradient_smoke','--smoke'])
         status('training_and_validation')
-        run([sys.executable,'-u','tools/train_omdet_turbo_counting.py',*common,
-            '--lr',str(SPEC['lr']),'--exemplar-lr',str(SPEC['exemplar_lr']),
+        run([sys.executable,'-u','tools/train_omdet_turbo_counting.py',*common,*lr_args,
             '--output',W/'omdet_counting','--epochs',str(SPEC['epochs']),
             '--accumulate',str(SPEC['accumulate'])])
     status('complete')
@@ -80,25 +80,25 @@ except BaseException as exc:
 MODE_META = {
     'eval': (
         'countyolo-omdet-turbo-eval-20261121',
-        'OmDet-Turbo v2 Full-Val (raw + 2x2 tiled), Pilot-58, and Absent evaluation',
+        'OmDet-Turbo v3 Full-Val (raw + 2x2 tiled), Pilot-58, and Absent evaluation',
         False,
     ),
     'text': (
-        'countyolo-omdet-turbo-text-v2-20261121',
-        'OmDet-Turbo v2 Text-Only (Frozen CLIP class heads + RT-DETR HybridEncoder + balanced 8-class negatives)',
+        'countyolo-omdet-turbo-text-v3-20261121',
+        'OmDet-Turbo v3 Text-Only (Unfrozen Swin stages 1-3 + 2-layer Bi-Prompt P3/P4/P5 FPN Fusion + Frozen CLIP anchors)',
         False,
     ),
     'multimodal': (
-        'countyolo-omdet-turbo-mm-v2-20261121',
-        'OmDet-Turbo v2 Class-Agnostic Multimodal (Frozen CLIP heads + Spatial Sim-Map + Direct Visual Cosine Head + 33/33/33 Modality Dropout)',
+        'countyolo-omdet-turbo-mm-v3-20261121',
+        'OmDet-Turbo v3 Multimodal (Unfrozen Swin 1-3 + 2-layer Bi-Prompt P3/P4/P5 FPN Fusion + Same-Space Sim + Decoupled Zero-Mean Visual Head)',
         True,
     ),
 }
 
 
 def prepare(user='nadthien', mode='multimodal', model_id='omlab/omdet-turbo-swin-tiny-hf',
-            epochs=20, lr=3e-5, exemplar_lr=2e-4, max_classes=8, neg_class_weight=0.5,
-            tile_trigger=600, init_kernel=None, init_dataset=None):
+            epochs=18, backbone_lr=1e-5, lr=3e-5, fusion_lr=1.5e-4, cal_lr=1.5e-3,
+            max_classes=8, neg_class_weight=0.5, tile_trigger=600, init_kernel=None, init_dataset=None):
     slug, purpose, use_exemplars = MODE_META[mode]
     folder = ROOT / 'kaggle_video_run' / user / slug
     folder.mkdir(parents=True, exist_ok=True)
@@ -108,11 +108,14 @@ def prepare(user='nadthien', mode='multimodal', model_id='omlab/omdet-turbo-swin
         model_id=model_id,
         epochs=epochs,
         accumulate=4,
+        backbone_lr=backbone_lr,
         lr=lr,
-        exemplar_lr=exemplar_lr,
+        fusion_lr=fusion_lr,
+        cal_lr=cal_lr,
         max_classes=max_classes,
         neg_class_weight=neg_class_weight,
         use_exemplars=use_exemplars,
+        unfreeze_backbone_stages=True,
         freeze_class_heads=True,
         tile_trigger=tile_trigger,
         init_kernel=init_kernel,
@@ -164,9 +167,11 @@ def main():
     p.add_argument('--user', default='nadthien')
     p.add_argument('--mode', choices=sorted(MODE_META), default='multimodal')
     p.add_argument('--model-id', default='omlab/omdet-turbo-swin-tiny-hf')
-    p.add_argument('--epochs', type=int, default=20)
+    p.add_argument('--epochs', type=int, default=18)
+    p.add_argument('--backbone-lr', type=float, default=1e-5)
     p.add_argument('--lr', type=float, default=3e-5)
-    p.add_argument('--exemplar-lr', type=float, default=2e-4)
+    p.add_argument('--fusion-lr', type=float, default=1.5e-4)
+    p.add_argument('--cal-lr', type=float, default=1.5e-3)
     p.add_argument('--max-classes', type=int, default=8)
     p.add_argument('--neg-class-weight', type=float, default=0.5)
     p.add_argument('--tile-trigger', type=int, default=600)
@@ -176,11 +181,12 @@ def main():
     a = p.parse_args()
     job = prepare(
         user=a.user, mode=a.mode, model_id=a.model_id,
-        epochs=a.epochs, lr=a.lr, exemplar_lr=a.exemplar_lr,
+        epochs=a.epochs, backbone_lr=a.backbone_lr, lr=a.lr,
+        fusion_lr=a.fusion_lr, cal_lr=a.cal_lr,
         max_classes=a.max_classes, neg_class_weight=a.neg_class_weight,
         tile_trigger=a.tile_trigger, init_kernel=a.init_kernel, init_dataset=a.init_dataset,
     )
-    ledger = ROOT / f'experiments/omdet_turbo_{a.mode}_v2_kaggle_20261121_{a.user}.json'
+    ledger = ROOT / f'experiments/omdet_turbo_{a.mode}_v3_kaggle_20261121_{a.user}.json'
     ledger.write_text(json.dumps(job, indent=2), encoding='utf-8')
     if a.push:
         ver, remote_state = push_with_retry(a.user, job)

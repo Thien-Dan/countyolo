@@ -1,8 +1,9 @@
-"""Train & evaluate OmDet-Turbo v2 (`omlab/omdet-turbo-swin-tiny-hf`) with:
-- Frozen CLIP class projection heads (prevents 89-class FSC-147 overfitting)
-- Class-Agnostic Direct Visual Matching + Spatial Sim-Map before Two-Stage Encoder
-- 3-mode Modality Dropout (33% Exemplar-Only / 33% Text+Exemplar / 33% Text-Only)
-- 7-layer differentiable CountGD-Box deep supervision, FrozenBN, warmup+cosine LR, and 2x2 tiling.
+"""Train & evaluate OmDet-Turbo v3 (`omlab/omdet-turbo-swin-tiny-hf`) with:
+- Unfrozen Swin stages 1-3 (`backbone_lr=1e-5`) to resolve dense small/texture objects (polka dots, coins)
+- 2-layer Multi-Scale P3/P4/P5 Bi-Directional Prompt Cross-Attention + Same-Space Spatial Sim-Map
+- Decoupled Zero-Mean Visual Matching Head (`vis_bias=-3.5`) + Frozen 7 CLIP semantic anchors
+- Balanced Modality Dropout (40% Text-Only / 35% Multimodal / 25% Exemplar-Only)
+- 4 independent gradient-clipping buckets, FrozenBN, warmup+cosine LR, and adaptive 2x2 tiling.
 """
 import argparse
 import json
@@ -137,7 +138,7 @@ class OmDetData:
 def predict_with_tiling(model: OmDetTurboCounting, pil_image: Image.Image, prompt: str,
                         exemplar_boxes=None, use_text: bool = True,
                         threshold: float = 0.23, tile_trigger: int = 600):
-    """Run NMS-free OmDet-Turbo v2 inference with optional 2x2 adaptive quadrant tiling."""
+    """Run NMS-free OmDet-Turbo v3 inference with optional 2x2 adaptive quadrant tiling."""
     use_amp = torch.cuda.is_available()
     with torch.autocast('cuda', dtype=torch.float16, enabled=use_amp):
         boxes, logits = model(pil_image, prompt, exemplar_boxes=exemplar_boxes, use_text=use_text)
@@ -210,15 +211,17 @@ def main():
     p.add_argument('--data-root', type=Path, required=True)
     p.add_argument('--model-id', type=str, default='omlab/omdet-turbo-swin-tiny-hf')
     p.add_argument('--output', type=Path, required=True)
-    p.add_argument('--epochs', type=int, default=20)
+    p.add_argument('--epochs', type=int, default=18)
     p.add_argument('--accumulate', type=int, default=4)
-    p.add_argument('--lr', type=float, default=3e-5, help='Gentle LR for pretrained OmDet-Turbo encoder/decoder')
-    p.add_argument('--exemplar-lr', type=float, default=2e-4, help='Higher LR for newly initialized visual matching heads')
-    p.add_argument('--cal-lr', type=float, default=2e-3, help='Dedicated LR for vis_logit_scale / vis_logit_bias calibration')
-    p.add_argument('--max-classes', type=int, default=8, help='Classes per forward when text is active')
-    p.add_argument('--neg-class-weight', type=float, default=0.5, help='Balanced negative weight on non-target CLIP classes')
-    p.add_argument('--use-exemplars', action='store_true', help='Enable Class-Agnostic Visual Exemplar Matching')
-    p.add_argument('--unfreeze-class-heads', action='store_true', help='Disable freezing of CLIP class projection heads')
+    p.add_argument('--backbone-lr', type=float, default=1e-5, help='Gentle LR for unfrozen Swin stages 1-3')
+    p.add_argument('--lr', type=float, default=3e-5, help='LR for pretrained OmDet-Turbo encoder/decoder')
+    p.add_argument('--fusion-lr', type=float, default=1.5e-4, help='LR for Bi-Prompt FPN fusion & visual heads')
+    p.add_argument('--cal-lr', type=float, default=1.5e-3, help='LR for scalar bias/gates')
+    p.add_argument('--max-classes', type=int, default=8)
+    p.add_argument('--neg-class-weight', type=float, default=0.5)
+    p.add_argument('--use-exemplars', action='store_true')
+    p.add_argument('--freeze-backbone', action='store_true', help='Keep Swin vision_backbone completely frozen')
+    p.add_argument('--unfreeze-class-heads', action='store_true')
     p.add_argument('--tile-trigger', type=int, default=600)
     p.add_argument('--init', type=Path)
     p.add_argument('--eval-only', action='store_true')
@@ -254,8 +257,9 @@ def main():
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     freeze_class_heads = not a.unfreeze_class_heads
+    unfreeze_bb = not a.freeze_backbone
     model = OmDetTurboCounting(
-        a.model_id, device=device, freeze_backbones=True,
+        a.model_id, device=device, unfreeze_backbone_stages=unfreeze_bb,
         freeze_class_heads=freeze_class_heads, use_exemplars=a.use_exemplars,
     )
     if a.init and a.init.exists():
@@ -272,13 +276,16 @@ def main():
         model_id=a.model_id,
         epochs=a.epochs,
         accumulate=a.accumulate,
+        backbone_lr=a.backbone_lr,
         lr=a.lr,
-        exemplar_lr=a.exemplar_lr,
+        fusion_lr=a.fusion_lr,
+        cal_lr=a.cal_lr,
         max_classes=a.max_classes,
         neg_class_weight=a.neg_class_weight,
         use_exemplars=a.use_exemplars,
+        unfreeze_backbone_stages=unfreeze_bb,
         freeze_class_heads=freeze_class_heads,
-        modality_dropout='33% exemplar-only / 33% multimodal / 33% text-only' if a.use_exemplars else '100% text-only',
+        modality_dropout='40% text-only / 35% multimodal / 25% exemplar-only' if a.use_exemplars else '100% text-only',
         tile_trigger=a.tile_trigger,
         init=str(a.init) if a.init else None,
         eval_only=a.eval_only,
@@ -315,27 +322,22 @@ def main():
         return
 
     criterion = CountingCriterion()
-    det_params, ex_body_params, cal_params = model.parameter_buckets()
+    bb_params, det_params, fus_params, cal_params = model.parameter_buckets()
     optimizer = torch.optim.AdamW(model.parameter_groups(
-        base_lr=a.lr, exemplar_lr=a.exemplar_lr, cal_lr=a.cal_lr, weight_decay=1e-4))
+        backbone_lr=a.backbone_lr, base_lr=a.lr, fusion_lr=a.fusion_lr, cal_lr=a.cal_lr, weight_decay=1e-4))
     steps_per_epoch = math.ceil(len(train.names) / a.accumulate)
     scheduler = make_warmup_cosine_scheduler(optimizer, total_steps=a.epochs * steps_per_epoch, warmup_steps=min(450, steps_per_epoch // 2))
     use_amp = (device == 'cuda') and not a.no_amp
     scaler = torch.amp.GradScaler('cuda', init_scale=256.0, enabled=use_amp)
 
     def clip_all_buckets():
-        # Independent gradient clipping per bucket so 25M pretrained params never choke new exemplar/calibration heads!
-        if det_params:
-            torch.nn.utils.clip_grad_norm_(det_params, 1.0)
-        if ex_body_params:
-            torch.nn.utils.clip_grad_norm_(ex_body_params, 1.0)
-        if cal_params:
-            torch.nn.utils.clip_grad_norm_(cal_params, 1.0)
+        for bucket in (bb_params, det_params, fus_params, cal_params):
+            if bucket:
+                torch.nn.utils.clip_grad_norm_(bucket, 1.0)
 
     if a.smoke:
         model.set_training(True)
         optimizer.zero_grad(set_to_none=True)
-        # Test BOTH Exemplar-Only (step 0) and Multimodal (step 1) when use_exemplars=True
         for idx_s, name in enumerate(train.names[:2]):
             sample = train.get(name, augment=True)
             use_txt = (idx_s == 1) or (not a.use_exemplars)
@@ -361,26 +363,27 @@ def main():
             assert torch.isfinite(loss), f'Non-finite loss: {loss}'
             scaler.scale(loss / 2.0).backward()
         scaler.unscale_(optimizer)
+        bb_g = sum(p.grad.abs().sum().item() for p in bb_params if p.grad is not None)
         enc_g = sum(p.grad.abs().sum().item() for p in model.detector.encoder.parameters() if p.grad is not None)
+        fus_g = sum(p.grad.abs().sum().item() for p in model.prompt_fusion_layers.parameters() if p.grad is not None)
         dec_b_g = sum(p.grad.abs().sum().item() for p in model.detector.decoder.decoder_bbox_head.parameters() if p.grad is not None)
-        enc_b_g = sum(p.grad.abs().sum().item() for p in model.detector.decoder.encoder_bbox_head.parameters() if p.grad is not None)
+        if unfreeze_bb:
+            assert math.isfinite(bb_g) and bb_g > 0, f'swin backbone stages 1-3 bad grad: {bb_g}'
         assert math.isfinite(enc_g) and enc_g > 0, f'encoder bad grad: {enc_g}'
+        assert math.isfinite(fus_g) and fus_g > 0, f'prompt_fusion_layers bad grad: {fus_g}'
         assert math.isfinite(dec_b_g) and dec_b_g > 0, f'decoder_bbox_head bad grad: {dec_b_g}'
-        assert math.isfinite(enc_b_g) and enc_b_g > 0, f'encoder_bbox_head bad grad: {enc_b_g}'
         if freeze_class_heads:
             assert all(p.grad is None for p in model.detector.decoder.decoder_class_head.parameters()), 'class_head must stay frozen'
         ex_msg = ''
         if a.use_exemplars:
             ex_p_g = sum(p.grad.abs().sum().item() for p in model.exemplar_proj.parameters() if p.grad is not None)
-            sim_g = sum(p.grad.abs().sum().item() for p in model.sim_fusion_convs.parameters() if p.grad is not None)
-            vq_g = sum(p.grad.abs().sum().item() for p in model.vis_query_head.parameters() if p.grad is not None)
-            ve_g = sum(p.grad.abs().sum().item() for p in model.vis_ex_head.parameters() if p.grad is not None)
+            vq_g = sum(p.grad.abs().sum().item() for p in model.vis_q_proj.parameters() if p.grad is not None)
+            ve_g = sum(p.grad.abs().sum().item() for p in model.vis_e_proj.parameters() if p.grad is not None)
             assert math.isfinite(ex_p_g) and ex_p_g > 0, f'exemplar_proj bad grad: {ex_p_g}'
-            assert math.isfinite(sim_g) and sim_g > 0, f'sim_fusion_convs bad grad: {sim_g}'
-            assert math.isfinite(vq_g) and vq_g > 0, f'vis_query_head bad grad: {vq_g}'
-            assert math.isfinite(ve_g) and ve_g > 0, f'vis_ex_head bad grad: {ve_g}'
-            ex_msg = f' ex_proj={ex_p_g:.4f} sim={sim_g:.4f} vis_q={vq_g:.4f} vis_e={ve_g:.4f}'
-        print(f'omdet v2.1 smoke grad sums: enc={enc_g:.4f} enc_bbox={enc_b_g:.4f} dec_bbox={dec_b_g:.4f}{ex_msg}', flush=True)
+            assert math.isfinite(vq_g) and vq_g > 0, f'vis_q_proj bad grad: {vq_g}'
+            assert math.isfinite(ve_g) and ve_g > 0, f'vis_e_proj bad grad: {ve_g}'
+            ex_msg = f' ex_proj={ex_p_g:.4f} vis_q={vq_g:.4f} vis_e={ve_g:.4f}'
+        print(f'omdet v3 smoke grad sums: bb={bb_g:.4f} enc={enc_g:.4f} biprompt={fus_g:.4f} dec_bbox={dec_b_g:.4f}{ex_msg}', flush=True)
         clip_all_buckets()
         scaler.step(optimizer)
         scaler.update()
@@ -392,8 +395,8 @@ def main():
                 exemplar_boxes=sample['exemplar_boxes'] if a.use_exemplars else None, tile_trigger=0)
         assert b.shape == (model.num_queries, 4) and s.shape == (model.num_queries,)
         save(a.output / 'smoke.json', dict(passed=True, loss=float(loss.detach()), queries=len(b), stages=7,
-                                           freeze_class_heads=freeze_class_heads, use_exemplars=a.use_exemplars))
-        print('omdet-turbo v2 smoke passed', float(loss.detach()), flush=True)
+                                           unfreeze_bb=unfreeze_bb, use_exemplars=a.use_exemplars))
+        print('omdet-turbo v3 smoke passed', float(loss.detach()), flush=True)
         return
 
     evaluate_omdet(model, val, dev, device, a.output / 'baseline_dev.json', use_exemplars=a.use_exemplars, use_text=True)
@@ -409,14 +412,14 @@ def main():
             sample = train.get(name, augment=True)
             has_ex = a.use_exemplars and len(sample['exemplar_boxes']) > 0
             if has_ex:
-                # 3-mode Modality Dropout: 33% Exemplar-Only, 33% Text+Exemplar, 33% Text-Only
+                # Balanced 40% Text-Only / 35% Multimodal / 25% Exemplar-Only
                 r = random.random()
-                if r < 1.0 / 3.0:
-                    use_txt, ex_boxes = False, sample['exemplar_boxes']
-                elif r < 2.0 / 3.0:
+                if r < 0.40:
+                    use_txt, ex_boxes = True, None
+                elif r < 0.75:
                     use_txt, ex_boxes = True, sample['exemplar_boxes']
                 else:
-                    use_txt, ex_boxes = True, None
+                    use_txt, ex_boxes = False, sample['exemplar_boxes']
             else:
                 use_txt, ex_boxes = True, None
 
@@ -457,15 +460,16 @@ def main():
             del st, loss, inputs
             if (i + 1) % 200 == 0:
                 torch.cuda.empty_cache()
-                v_sc = float(model.vis_logit_scale.exp().item()) if a.use_exemplars else 0.0
-                v_bs = float(model.vis_logit_bias.item()) if a.use_exemplars else 0.0
+                vg0 = float(torch.tanh(model.prompt_fusion_layers[0].v_gate).item())
+                tg = float(torch.tanh(model.text_prompt_gate).item())
+                vb = float(model.vis_logit_bias.item()) if a.use_exemplars else 0.0
                 save(a.output / 'progress.json', dict(epoch=epoch, images=i + 1, total=len(names),
                                                       mean_loss=float(np.mean(losses)),
                                                       cls_loss=float(np.mean(cls_losses)),
                                                       center_loss=float(np.mean(ctr_losses)),
                                                       lr=optimizer.param_groups[0]['lr'],
-                                                      vis_scale=v_sc, vis_bias=v_bs))
-                v_str = f' vscale {v_sc:.2f} vbias {v_bs:.2f}' if a.use_exemplars else ''
+                                                      vgate=vg0, tgate=tg, vbias=vb))
+                v_str = f' vgate {vg0:.3f} tgate {tg:.3f} vbias {vb:.2f}'
                 print(f"train {epoch} {i+1} {len(names)} loss {round(float(np.mean(losses)), 4)} "
                       f"cls {round(float(np.mean(cls_losses)), 4)} ctr {round(float(np.mean(ctr_losses)), 4)} "
                       f"lr {optimizer.param_groups[0]['lr']:.2e}{v_str}", flush=True)

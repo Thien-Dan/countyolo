@@ -6,7 +6,7 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import OmDetTurboConfig, OmDetTurboForObjectDetection, SwinConfig, CLIPTextConfig
 from models.yoloworld_counting import CountingCriterion
-from models.omdet_turbo_counting import OmDetTurboCounting, build_omdet_class_list
+from models.omdet_turbo_counting import OmDetTurboCounting, build_omdet_class_list, _is_stem_or_stage0_param
 from tools.train_omdet_turbo_counting import prepare_omdet_sample
 from tools.train_llmdet_counting import compute_7layer_loss
 
@@ -68,26 +68,35 @@ class OmDetTurboCountingTests(unittest.TestCase):
         self.assertEqual(len(sample['exemplar_indices']), 1)
         self.assertTrue((sample['supervision_points'] >= 0).all() and (sample['supervision_points'] <= 1).all())
 
-    def test_same_space_raw_similarity_self_matches_above_0_9_at_step_0(self):
-        """Verify same-space raw exemplar similarity peaks > 0.9 at the exemplar's own location before training."""
+    def test_same_space_raw_similarity_and_step0_zero_mean_visual_prior(self):
+        """Verify step-0 raw self-similarity > 0.99 AND visual logits start near -3.5 (no background cone explosion)."""
         tiny = _make_tiny_omdet()
         model = OmDetTurboCounting(
-            'tiny-omdet', device='cpu', freeze_backbones=True, freeze_class_heads=True,
+            'tiny-omdet', device='cpu', unfreeze_backbone_stages=True, freeze_class_heads=True,
             use_exemplars=True, detector=tiny, processor=object(),
         )
-        # Uniform patch inside [0.25..0.5, 0.25..0.5] embedded in distinct background
+        # 1) Same-space raw similarity
         feat = torch.randn(1, 32, 16, 16)
         feat[:, :, 4:8, 4:8] = torch.ones(1, 32, 1, 1) * 5.0
         boxes = torch.tensor([[0.25, 0.25, 0.50, 0.50]])
-        ex_raw = model._roi_pool_level(feat, boxes)  # (1, 32)
+        ex_raw = model._roi_pool_level(feat, boxes)
         sim = torch.einsum('bchw,ec->behw', F.normalize(feat, dim=1), F.normalize(ex_raw, dim=-1))
         self.assertGreater(float(sim[0, 0, 5, 5].item()), 0.99)
 
-    def test_all_three_modes_forward_backward_frozen_clip_heads_and_vbias_update(self):
-        """Verify 3 modes forward/backward, FrozenBN, frozen CLIP heads, and unchoked vbias optimizer step."""
+        # 2) Even if all queries live in a tight positive cone (simulating pretrained objectness cone),
+        #    decoupled zero-mean vis_q_proj / vis_e_proj + vis_bias(-3.5) keeps step-0 mean near -3.5 (p < 0.1)!
+        cone_q = torch.ones(1, 100, 32) + 0.1 * torch.randn(1, 100, 32)
+        cone_e = torch.ones(3, 32) + 0.1 * torch.randn(3, 32)
+        v_logits = model._visual_dot_logits(cone_q, cone_e)
+        self.assertLess(float(v_logits.mean().item()), -1.5)
+        self.assertIsNone(model.detector.encoder.eval_size)
+
+    def test_v3_all_modes_unfrozen_swin_biprompt_fpn_and_bucket_clipping(self):
+        """Verify Swin stages 1-3 + Bi-Prompt FPN + 7-stage heads + decoupled visual heads all get grads,
+        while Swin stem/stage0, CLIP language backbone, and 7 CLIP class anchors stay strictly frozen."""
         tiny = _make_tiny_omdet()
         model = OmDetTurboCounting(
-            'tiny-omdet', device='cpu', freeze_backbones=True, freeze_class_heads=True,
+            'tiny-omdet', device='cpu', unfreeze_backbone_stages=True, freeze_class_heads=True,
             use_exemplars=True, detector=tiny, processor=object(),
         )
         model.set_training(True)
@@ -125,10 +134,12 @@ class OmDetTurboCountingTests(unittest.TestCase):
         self.assertEqual(st_ex['logits'].shape, (12, 2))
         compute_7layer_loss(CountingCriterion(), st_ex, sample, 'cpu')[0].backward()
 
-        # 3) Multimodal + optimizer step with independent bucket clipping
-        opt = torch.optim.AdamW(model.parameter_groups(base_lr=3e-5, exemplar_lr=2e-4, cal_lr=2e-3))
-        det_p, ex_p, cal_p = model.parameter_buckets()
+        # 3) Multimodal + 4-bucket independent clipping & optimizer step
+        opt = torch.optim.AdamW(model.parameter_groups())
+        bb_p, det_p, fus_p, cal_p = model.parameter_buckets()
+        self.assertTrue(len(bb_p) > 0 and len(det_p) > 0 and len(fus_p) > 0 and len(cal_p) > 0)
         vbias_before = float(model.vis_logit_bias.item())
+
         opt.zero_grad(set_to_none=True)
         st_mm = model.forward_stages(
             pixel_values, classes_ids, classes_mask, tasks_ids, tasks_mask, classes_struct,
@@ -137,21 +148,27 @@ class OmDetTurboCountingTests(unittest.TestCase):
         self.assertEqual(st_mm['logits'].shape, (12, 5))
         compute_7layer_loss(CountingCriterion(), st_mm, sample, 'cpu')[0].backward()
 
+        # Verify ALL trainable blocks received real non-zero gradients
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in bb_p))
         self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.detector.encoder.parameters()))
-        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.detector.decoder.encoder_bbox_head.parameters()))
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.prompt_fusion_layers.parameters()))
         self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.detector.decoder.decoder_bbox_head.parameters()))
         self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.exemplar_proj.parameters()))
         self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.sim_fusion_convs.parameters()))
-        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.vis_query_head.parameters()))
-        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.vis_ex_head.parameters()))
-        self.assertTrue(all(p.grad is None for p in model.detector.vision_backbone.parameters()))
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.vis_q_proj.parameters()))
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.vis_e_proj.parameters()))
+        self.assertTrue(model.prompt_fusion_layers[0].null_k.grad is not None and model.prompt_fusion_layers[0].null_k.grad.abs().sum() > 0)
+
+        # Verify frozen blocks stayed strictly frozen
+        for name, param in model.detector.vision_backbone.named_parameters():
+            if _is_stem_or_stage0_param(name):
+                self.assertIsNone(param.grad, f'Stem/stage0 param {name} should stay frozen')
         self.assertTrue(all(p.grad is None for p in model.detector.language_backbone.parameters()))
         self.assertTrue(all(p.grad is None for p in model.detector.decoder.encoder_class_head.parameters()))
         self.assertTrue(all(p.grad is None for p in model.detector.decoder.decoder_class_head.parameters()))
 
-        torch.nn.utils.clip_grad_norm_(det_p, 1.0)
-        torch.nn.utils.clip_grad_norm_(ex_p, 1.0)
-        torch.nn.utils.clip_grad_norm_(cal_p, 1.0)
+        for bucket in (bb_p, det_p, fus_p, cal_p):
+            torch.nn.utils.clip_grad_norm_(bucket, 1.0)
         opt.step()
         self.assertGreater(abs(float(model.vis_logit_bias.item()) - vbias_before), 1e-4)
 
