@@ -224,8 +224,13 @@ class LLMDetCounting(nn.Module):
             token_type_ids = token_type_ids[:, :text_budget]
 
         raw_self_attn, raw_pos_ids = generate_text_masks(input_ids)
+        # Transformers 5.x BertModel SDPA expects 4D (B, 1, L, L) for custom block-diagonal masks
         text_outputs = m.text_backbone(
-            input_ids, raw_self_attn, token_type_ids, raw_pos_ids, return_dict=True
+            input_ids=input_ids,
+            attention_mask=raw_self_attn.unsqueeze(1),
+            token_type_ids=token_type_ids,
+            position_ids=raw_pos_ids,
+            return_dict=True,
         )
         text_features = m.text_projection(text_outputs.last_hidden_state)
 
