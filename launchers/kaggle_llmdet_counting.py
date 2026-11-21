@@ -44,9 +44,9 @@ try:
     if len(roots)!=1:raise RuntimeError('Attach exactly one FSC147 dataset')
     data=roots[0]
     init_args=[]
-    if SPEC.get('init_kernel'):
+    if SPEC.get('init_kernel') or SPEC.get('init_dataset'):
         ckpts=sorted(glob.glob('/kaggle/input/**/best.pth',recursive=True))
-        if not ckpts:raise RuntimeError('Expected best.pth from attached init_kernel')
+        if not ckpts:raise RuntimeError('Expected best.pth from attached init_kernel or init_dataset')
         init_args=['--init',ckpts[0]]
         print('Found init checkpoint:',ckpts[0],flush=True)
     status('tests');run([sys.executable,'-m','unittest','tools.test_llmdet_counting'])
@@ -91,7 +91,7 @@ MODE_META = {
 
 
 def prepare(user='thiend27', mode='text_mc', model_id='iSEE-Laboratory/llmdet_tiny',
-            epochs=14, step_size=9, max_classes=40, tile_trigger=600, init_kernel=None):
+            epochs=14, step_size=9, max_classes=40, tile_trigger=600, init_kernel=None, init_dataset=None):
     slug, purpose, use_exemplars = MODE_META[mode]
     folder = ROOT / 'kaggle_video_run' / user / slug
     folder.mkdir(parents=True, exist_ok=True)
@@ -108,6 +108,7 @@ def prepare(user='thiend27', mode='text_mc', model_id='iSEE-Laboratory/llmdet_ti
         exemplar_prob=0.7,
         tile_trigger=tile_trigger,
         init_kernel=init_kernel,
+        init_dataset=init_dataset,
         fsc147d_prompts=True,
         nms_free=True,
     )
@@ -120,9 +121,12 @@ def prepare(user='thiend27', mode='text_mc', model_id='iSEE-Laboratory/llmdet_ti
     code = RUNNER.replace('__FILES__', repr(payload)).replace('__SPEC__', repr(spec))
     compile(code, 'run.py', 'exec')
     (folder / 'run.py').write_text(code, encoding='utf-8', newline='\n')
+    ds_sources = ['xuncngng/fsc147-0']
+    if init_dataset:
+        ds_sources.append(init_dataset)
     metadata = dict(
         id=f'{user}/{slug}', title=slug, code_file='run.py', language='python', kernel_type='script',
-        is_private=True, enable_gpu=True, enable_internet=True, dataset_sources=['xuncngng/fsc147-0'],
+        is_private=True, enable_gpu=True, enable_internet=True, dataset_sources=ds_sources,
         kernel_sources=[init_kernel] if init_kernel else [], competition_sources=[])
     (folder / 'kernel-metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
     return dict(ref=metadata['id'], folder=str(folder), state='prepared', spec=spec,
@@ -157,12 +161,13 @@ def main():
     p.add_argument('--max-classes', type=int, default=40)
     p.add_argument('--tile-trigger', type=int, default=600)
     p.add_argument('--init-kernel', default=None, help='Kaggle kernel ref whose best.pth will be attached')
+    p.add_argument('--init-dataset', default=None, help='Kaggle dataset ref containing best.pth')
     p.add_argument('--push', action='store_true')
     a = p.parse_args()
     job = prepare(
         user=a.user, mode=a.mode, model_id=a.model_id,
         epochs=a.epochs, step_size=a.step_size, max_classes=a.max_classes,
-        tile_trigger=a.tile_trigger, init_kernel=a.init_kernel,
+        tile_trigger=a.tile_trigger, init_kernel=a.init_kernel, init_dataset=a.init_dataset,
     )
     ledger = ROOT / f'experiments/llmdet_{a.mode}_kaggle_20261121_{a.user}.json'
     ledger.write_text(json.dumps(job, indent=2), encoding='utf-8')
