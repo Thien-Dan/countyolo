@@ -5,10 +5,11 @@ Architecture (`iSEE-Laboratory/llmdet_tiny` / `llmdet_base` / `llmdet_large`):
 - Frozen Swin visual backbone + frozen BERT language backbone
 - Trainable 6-layer Bi-directional Feature Enhancer Encoder
 - Trainable Language-Guided Query Selection (`enc_output`, `encoder_output_class_embed`, `encoder_output_bbox_embed`)
-- Trainable 6-layer Deformable DETR Decoder (900 queries, 100% NMS-free)
-- Optional Visual Exemplar Projector (`exemplar_proj`) extracting ROIAlign(1x1) embeddings from
-  multi-scale vision features and injecting them as pseudo-tokens directly into `text_features`
-  inside the target phrase's block-diagonal self-attention span (CountGD protocol).
+- Trainable 6-layer Deformable DETR Decoder (900 queries, 100% NMS-free) with differentiable iterative
+  box refinement (`bbox_embed[0..5]`) and contrastive classification (`class_embed[0..5]`)
+- Optional Visual Exemplar Projector (`exemplar_proj` + `exemplar_norm` + `exemplar_type_embed`)
+  extracting ROIAlign(1x1) embeddings aligned to Swin `valid_ratios` and injecting them as pseudo-tokens
+  directly into `text_features` inside the target phrase's block-diagonal self-attention span.
 """
 import random
 import torch
@@ -35,34 +36,32 @@ def token_span_mask(input_ids: torch.LongTensor) -> torch.BoolTensor:
 def generate_text_masks(input_ids: torch.LongTensor):
     """Build block-diagonal self-attention mask (B, L, L) and per-phrase position_ids (B, L).
 
-    Matches GroundingDINO / MM-Grounding-DINO's `generate_masks_with_special_tokens_and_transfer_map`:
-    tokens within each '.'-delimited phrase attend bidirectionally to each other (including any
-    injected visual exemplar tokens) while staying completely isolated from other class phrases.
+    Matches HuggingFace `MMGroundingDinoModel`'s `generate_masks_with_special_tokens_and_transfer_map`:
+    each phrase (including its trailing '.' delimiter, plus any injected visual exemplar tokens)
+    attends bidirectionally within its own block while remaining isolated from all other phrases.
     """
     bsz, seq_len = input_ids.shape
     device = input_ids.device
     special = torch.tensor(DELIMITER_TOKEN_IDS, device=device)
-    is_delim = torch.isin(input_ids, special) | (input_ids == 0)
+    is_delim = torch.isin(input_ids, special)
 
     attn_mask = torch.eye(seq_len, dtype=torch.bool, device=device).unsqueeze(0).repeat(bsz, 1, 1)
     pos_ids = torch.zeros((bsz, seq_len), dtype=torch.long, device=device)
     for b in range(bsz):
-        start = None
-        for idx in range(seq_len):
-            if bool(is_delim[b, idx]):
-                if start is not None:
-                    attn_mask[b, start:idx, start:idx] = True
-                    pos_ids[b, start:idx] = torch.arange(idx - start, device=device)
-                    start = None
-            elif start is None:
-                start = idx
-        if start is not None:
-            attn_mask[b, start:seq_len, start:seq_len] = True
-            pos_ids[b, start:seq_len] = torch.arange(seq_len - start, device=device)
+        idxs = torch.nonzero(is_delim[b], as_tuple=False).flatten().tolist()
+        prev = 0
+        for col in idxs:
+            if col == 0 or col == seq_len - 1:
+                attn_mask[b, col, col] = True
+                pos_ids[b, col] = 0
+            else:
+                attn_mask[b, prev + 1 : col + 1, prev + 1 : col + 1] = True
+                pos_ids[b, prev + 1 : col + 1] = torch.arange(0, col - prev, device=device)
+            prev = col
     return attn_mask, pos_ids
 
 
-def build_multiclass_caption(target_prompt: str, vocabulary: list[str], max_classes: int = 40, rng=None):
+def build_multiclass_caption(target_prompt: str, vocabulary: list[str], max_classes: int = 8, rng=None):
     """Build a GroundingDINO/CountGD single-forward multi-class caption (`c1 . c2 . ... .`).
 
     Returns `(caption, target_phrase_idx)` where `target_phrase_idx` is the 0-based index of
@@ -105,36 +104,43 @@ def phrase_token_span(input_ids: torch.LongTensor, phrase_idx: int) -> tuple[int
 
 
 class LLMDetCounting(nn.Module):
-    ARCHITECTURE = 'llmdet-countgd-box-7layer-v2'
+    ARCHITECTURE = 'llmdet-countgd-box-7layer-v3'
 
     def __init__(self, model_id='iSEE-Laboratory/llmdet_tiny', device='cuda',
-                 freeze_backbones=True, use_exemplars=False):
+                 freeze_backbones=True, use_exemplars=False, detector=None, processor=None):
         super().__init__()
         self.model_id = str(model_id)
         self.device = device
         self.use_exemplars = bool(use_exemplars)
-        self.processor = AutoProcessor.from_pretrained(self.model_id)
-        self.detector = AutoModelForZeroShotObjectDetection.from_pretrained(self.model_id).to(device).float()
+        self.processor = processor if processor is not None else AutoProcessor.from_pretrained(self.model_id)
+        self.detector = (detector if detector is not None else AutoModelForZeroShotObjectDetection.from_pretrained(self.model_id)).to(device).float()
         self.freeze_backbones = freeze_backbones
         if freeze_backbones:
             self.detector.model.backbone.requires_grad_(False)
             self.detector.model.text_backbone.requires_grad_(False)
         self.d_model = int(self.detector.config.d_model)
         if self.use_exemplars:
+            gn_groups = 32 if self.d_model % 32 == 0 else max(1, self.d_model // 8)
             self.exemplar_proj = nn.Sequential(
                 nn.Conv2d(3 * self.d_model, self.d_model, kernel_size=1),
-                nn.GroupNorm(32, self.d_model),
+                nn.GroupNorm(gn_groups, self.d_model),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(self.d_model, self.d_model, kernel_size=1),
             ).to(device).float()
+            self.exemplar_norm = nn.LayerNorm(self.d_model).to(device).float()
+            self.exemplar_type_embed = nn.Parameter(torch.zeros(1, 1, self.d_model, device=device, dtype=torch.float32))
+            nn.init.normal_(self.exemplar_type_embed, std=0.02)
         else:
             self.exemplar_proj = None
+            self.exemplar_norm = None
+            self.exemplar_type_embed = None
         self.set_training(False)
 
     def set_training(self, training: bool):
         self.detector.train(training)
         if self.exemplar_proj is not None:
             self.exemplar_proj.train(training)
+            self.exemplar_norm.train(training)
         if self.freeze_backbones:
             self.detector.model.backbone.eval()
             self.detector.model.text_backbone.eval()
@@ -143,7 +149,41 @@ class LLMDetCounting(nn.Module):
         params = [(n, p) for n, p in self.detector.named_parameters() if p.requires_grad]
         if self.exemplar_proj is not None:
             params.extend([(f'__exemplar_proj__.{n}', p) for n, p in self.exemplar_proj.named_parameters() if p.requires_grad])
+            params.extend([(f'__exemplar_norm__.{n}', p) for n, p in self.exemplar_norm.named_parameters() if p.requires_grad])
+            params.append(('__exemplar_type_embed__', self.exemplar_type_embed))
         return params
+
+    def parameter_groups(self, base_lr=2e-5, exemplar_lr=1e-4, weight_decay=1e-4):
+        """Differential LR: gentle fine-tuning for pretrained LLMDet, higher LR for new exemplar head."""
+        det_params = [p for _, p in self.detector.named_parameters() if p.requires_grad]
+        groups = [dict(params=det_params, lr=base_lr, weight_decay=weight_decay)]
+        if self.exemplar_proj is not None:
+            ex_params = (
+                list(self.exemplar_proj.parameters())
+                + list(self.exemplar_norm.parameters())
+                + [self.exemplar_type_embed]
+            )
+            groups.append(dict(params=ex_params, lr=exemplar_lr, weight_decay=weight_decay))
+        return groups
+
+    def _encode_text_backbone(self, m, input_ids, raw_self_attn, token_type_ids, raw_pos_ids):
+        """Call BERT text_backbone compatibly across transformers 4.x (3D mask) and 5.x SDPA (4D mask)."""
+        try:
+            return m.text_backbone(
+                input_ids=input_ids,
+                attention_mask=raw_self_attn.unsqueeze(1),
+                token_type_ids=token_type_ids,
+                position_ids=raw_pos_ids,
+                return_dict=True,
+            )
+        except (RuntimeError, ValueError):
+            return m.text_backbone(
+                input_ids=input_ids,
+                attention_mask=raw_self_attn,
+                token_type_ids=token_type_ids,
+                position_ids=raw_pos_ids,
+                return_dict=True,
+            )
 
     def _extract_vision_features(self, pixel_values, pixel_mask):
         m = self.detector.model
@@ -166,20 +206,21 @@ class LLMDetCounting(nn.Module):
                 position_embeddings_list.append(pos_l)
         return feature_maps, masks, position_embeddings_list, pixel_mask
 
-    def _extract_exemplar_tokens(self, feature_maps, pixel_values, pixel_mask, exemplar_boxes):
-        """Extract (1, E, d_model) visual exemplar embeddings via ROIAlign(1x1) on fused FPN features."""
+    def _extract_exemplar_tokens(self, feature_maps, masks, exemplar_boxes):
+        """Extract (1, E, d_model) normalized exemplar tokens via ROIAlign(1x1) using Swin valid_ratios."""
+        m = self.detector.model
         h0, w0 = feature_maps[0].shape[-2:]
+        lvl1 = feature_maps[1] if len(feature_maps) > 1 else feature_maps[0]
+        lvl2 = feature_maps[2] if len(feature_maps) > 2 else lvl1
         fused = torch.cat([
             feature_maps[0],
-            F.interpolate(feature_maps[1], size=(h0, w0), mode='bilinear', align_corners=False),
-            F.interpolate(feature_maps[2], size=(h0, w0), mode='bilinear', align_corners=False),
+            F.interpolate(lvl1, size=(h0, w0), mode='bilinear', align_corners=False),
+            F.interpolate(lvl2, size=(h0, w0), mode='bilinear', align_corners=False),
         ], dim=1)
         fused = self.exemplar_proj(fused)
-        _, _, h_pad, w_pad = pixel_values.shape
-        valid_h = float(pixel_mask[0, :, 0].sum().item()) if pixel_mask is not None else float(h_pad)
-        valid_w = float(pixel_mask[0, 0, :].sum().item()) if pixel_mask is not None else float(w_pad)
-        sx = w0 * (valid_w / max(1.0, float(w_pad)))
-        sy = h0 * (valid_h / max(1.0, float(h_pad)))
+        valid_ratio = m.get_valid_ratio(masks[0])[0]  # [valid_w_ratio, valid_h_ratio]
+        sx = float(w0) * float(valid_ratio[0].item())
+        sy = float(h0) * float(valid_ratio[1].item())
         boxes = exemplar_boxes.to(device=fused.device, dtype=torch.float32)
         scaled = torch.stack([
             (boxes[:, 0] * sx).clamp(0.0, float(w0)),
@@ -187,8 +228,9 @@ class LLMDetCounting(nn.Module):
             (boxes[:, 2] * sx).clamp(0.0, float(w0)),
             (boxes[:, 3] * sy).clamp(0.0, float(h0)),
         ], dim=-1)
-        pooled = roi_align(fused.float(), [scaled], output_size=(1, 1), aligned=True).flatten(1)
-        return pooled.unsqueeze(0).to(fused.dtype)
+        pooled = roi_align(fused.float(), [scaled], output_size=(1, 1), aligned=True).flatten(1).unsqueeze(0)
+        tokens = self.exemplar_norm(pooled) + self.exemplar_type_embed
+        return tokens.to(fused.dtype)
 
     @torch.no_grad()
     def encode_exemplars(self, pil_image, exemplar_boxes):
@@ -196,12 +238,12 @@ class LLMDetCounting(nn.Module):
         if not self.use_exemplars or exemplar_boxes is None or len(exemplar_boxes) == 0:
             return None
         inputs = self.processor(images=pil_image, text='object .', do_resize=False, return_tensors='pt').to(self.device)
-        feature_maps, _, _, pixel_mask = self._extract_vision_features(inputs['pixel_values'], inputs.get('pixel_mask'))
-        return self._extract_exemplar_tokens(feature_maps, inputs['pixel_values'], pixel_mask, exemplar_boxes)
+        feature_maps, masks, _, _ = self._extract_vision_features(inputs['pixel_values'], inputs.get('pixel_mask'))
+        return self._extract_exemplar_tokens(feature_maps, masks, exemplar_boxes)
 
     def forward_stages(self, pixel_values, pixel_mask, input_ids, attention_mask, token_type_ids=None,
                        target_phrase_idx=0, exemplar_boxes=None, exemplar_feats=None):
-        """Run MM-Grounding-DINO forward with optional exemplar injection and return all 7 stages."""
+        """Run MM-Grounding-DINO forward with differentiable 7-stage boxes/logits & optional exemplar injection."""
         m = self.detector.model
         max_text_len = int(m.config.max_text_len)
         if attention_mask is None:
@@ -216,7 +258,7 @@ class LLMDetCounting(nn.Module):
             elif exemplar_boxes is not None and len(exemplar_boxes) > 0:
                 num_ex = int(len(exemplar_boxes))
 
-        # Truncate raw text if needed so injected exemplar tokens always fit inside max_text_len
+        # Reserve token budget for injected exemplars inside max_text_len
         text_budget = max_text_len - num_ex
         if input_ids.shape[1] > text_budget:
             input_ids = input_ids[:, :text_budget]
@@ -224,14 +266,7 @@ class LLMDetCounting(nn.Module):
             token_type_ids = token_type_ids[:, :text_budget]
 
         raw_self_attn, raw_pos_ids = generate_text_masks(input_ids)
-        # Transformers 5.x BertModel SDPA expects 4D (B, 1, L, L) for custom block-diagonal masks
-        text_outputs = m.text_backbone(
-            input_ids=input_ids,
-            attention_mask=raw_self_attn.unsqueeze(1),
-            token_type_ids=token_type_ids,
-            position_ids=raw_pos_ids,
-            return_dict=True,
-        )
+        text_outputs = self._encode_text_backbone(m, input_ids, raw_self_attn, token_type_ids, raw_pos_ids)
         text_features = m.text_projection(text_outputs.last_hidden_state)
 
         feature_maps, masks, position_embeddings_list, pixel_mask = self._extract_vision_features(pixel_values, pixel_mask)
@@ -239,7 +274,7 @@ class LLMDetCounting(nn.Module):
         pos_start, pos_end = phrase_token_span(input_ids, target_phrase_idx)
         if self.use_exemplars and num_ex > 0:
             ex_tok = exemplar_feats.to(text_features.device, text_features.dtype) if exemplar_feats is not None else \
-                self._extract_exemplar_tokens(feature_maps, pixel_values, pixel_mask, exemplar_boxes).to(text_features.dtype)
+                self._extract_exemplar_tokens(feature_maps, masks, exemplar_boxes).to(text_features.dtype)
             ex_ids = torch.full((1, num_ex), EXEMPLAR_TOKEN_ID, dtype=input_ids.dtype, device=input_ids.device)
             ex_mask = torch.ones((1, num_ex), dtype=attention_mask.dtype, device=attention_mask.device)
             input_ids = torch.cat([input_ids[:, :pos_end], ex_ids, input_ids[:, pos_end:]], dim=1)
@@ -299,21 +334,29 @@ class LLMDetCounting(nn.Module):
             topk = m.config.num_queries
             topk_logits = enc_outputs_class.max(-1)[0]
             topk_proposals = torch.topk(topk_logits, topk, dim=1)[1]
-            topk_coords_logits = torch.gather(
+            topk_coords_raw = torch.gather(
                 enc_outputs_coord_logits, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4)
-            ).detach()
-            reference_points = topk_coords_logits.sigmoid()
+            )
+            topk_class_raw = torch.gather(
+                enc_outputs_class, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, enc_outputs_class.shape[-1])
+            )
+            # Differentiable encoder stage outputs (trains enc_output, encoder_output_bbox_embed & encoder_output_class_embed)
+            encoder_pred_boxes = topk_coords_raw.sigmoid()[0]
+            encoder_logits = topk_class_raw[0]
+
+            # Detached initial reference points fed to decoder (standard two-stage Deformable DETR)
+            reference_points = topk_coords_raw.detach().sigmoid()
+            init_reference_points = reference_points
             if query_embeds is not None:
                 target = query_embeds.unsqueeze(0).repeat(pixel_values.shape[0], 1, 1)
             else:
                 target = torch.gather(
                     object_query_embedding, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, m.d_model)
                 ).detach()
-            encoder_pred_boxes = reference_points[0]
-            encoder_logits = m.encoder_output_class_embed(target, text_features, text_token_mask)[0]
         else:
             target = query_embeds.unsqueeze(0).repeat(pixel_values.shape[0], 1, 1)
             reference_points = m.reference_points.weight.unsqueeze(0).repeat(pixel_values.shape[0], 1, 1).sigmoid()
+            init_reference_points = reference_points
 
         decoder_outputs = m.decoder(
             inputs_embeds=target,
@@ -342,15 +385,27 @@ class LLMDetCounting(nn.Module):
         if not target_tokens.any():
             target_tokens = torch.ones(int(active_mask.sum()), dtype=torch.bool, device=input_ids.device)
 
+        # Recompute differentiable stage boxes via bbox_embed[level] (matches MMGroundingDinoForObjectDetection);
+        # inter_refs from decoder are detached, so using inter_refs directly kills all box/center gradients!
         stage_boxes, stage_logits = [], []
         for level in range(hidden_states.shape[1]):
+            ref = init_reference_points if level == 0 else inter_refs[:, level - 1]
+            ref_logit = torch.special.logit(ref.float(), eps=1e-5)
+            delta_b = self.detector.bbox_embed[level](hidden_states[:, level]).float()
+            if ref_logit.shape[-1] == 4:
+                pred_coord = (delta_b + ref_logit).sigmoid()
+            else:
+                delta_b = delta_b.clone()
+                delta_b[..., :2] = delta_b[..., :2] + ref_logit
+                pred_coord = delta_b.sigmoid()
             cls_logits = self.detector.class_embed[level](
                 vision_hidden_state=hidden_states[:, level],
                 text_hidden_state=enc_text,
                 text_token_mask=text_token_mask,
             )[0, :, :seq_len][:, active_mask]
-            stage_boxes.append(inter_refs[:, level][0].float())
+            stage_boxes.append(pred_coord[0].float())
             stage_logits.append(cls_logits.float())
+
         if encoder_logits is not None:
             encoder_logits = encoder_logits[:, :seq_len][:, active_mask].float()
         if encoder_pred_boxes is not None:
@@ -387,10 +442,15 @@ class LLMDetCounting(nn.Module):
         return {n: p.detach().cpu() for n, p in self.trainable_parameters()}
 
     def import_trainable_state(self, state):
-        det_state = {k: v for k, v in state.items() if not k.startswith('__exemplar_proj__.')}
-        ex_state = {k[len('__exemplar_proj__.'):]: v for k, v in state.items() if k.startswith('__exemplar_proj__.')}
+        det_state = {k: v for k, v in state.items() if not k.startswith('__exemplar_')}
+        ex_proj = {k[len('__exemplar_proj__.'):]: v for k, v in state.items() if k.startswith('__exemplar_proj__.')}
+        ex_norm = {k[len('__exemplar_norm__.'):]: v for k, v in state.items() if k.startswith('__exemplar_norm__.')}
         _, unexpected = self.detector.load_state_dict(det_state, strict=False)
         if unexpected:
             raise RuntimeError(f'Unexpected keys in LLMDet checkpoint: {unexpected[:5]}')
-        if self.exemplar_proj is not None and ex_state:
-            self.exemplar_proj.load_state_dict(ex_state, strict=True)
+        if self.exemplar_proj is not None and ex_proj:
+            self.exemplar_proj.load_state_dict(ex_proj, strict=True)
+        if self.exemplar_norm is not None and ex_norm:
+            self.exemplar_norm.load_state_dict(ex_norm, strict=True)
+        if self.exemplar_type_embed is not None and '__exemplar_type_embed__' in state:
+            self.exemplar_type_embed.data.copy_(state['__exemplar_type_embed__'].to(self.exemplar_type_embed.device))

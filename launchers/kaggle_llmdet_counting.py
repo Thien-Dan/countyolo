@@ -1,4 +1,4 @@
-"""Package and submit LLMDet experiments (eval / text_mc / multimodal) to Kaggle."""
+"""Package and submit LLMDet v3 experiments (eval / text_mc / multimodal) to Kaggle."""
 import argparse
 import base64
 from datetime import datetime, timezone
@@ -52,20 +52,24 @@ try:
     status('tests');run([sys.executable,'-m','unittest','tools.test_llmdet_counting'])
     common=['--data-root',data,'--model-id',SPEC['model_id'],
         '--exclude-train',W/'inputs/exclude_train.json','--pilot-images',W/'inputs/pilot58.json',
-        '--max-classes',str(SPEC['max_classes']),'--tile-trigger',str(SPEC['tile_trigger']),*init_args]
+        '--max-classes',str(SPEC['max_classes']),'--neg-class-weight',str(SPEC['neg_class_weight']),
+        '--tile-trigger',str(SPEC['tile_trigger']),*init_args]
     if SPEC.get('use_exemplars'):
-        common.extend(['--use-exemplars','--exemplar-prob',str(SPEC.get('exemplar_prob',0.7))])
+        common.extend(['--use-exemplars','--exemplar-prob',str(SPEC.get('exemplar_prob',0.5))])
     if SPEC['mode']=='eval':
         status('evaluating')
         run([sys.executable,'-u','tools/train_llmdet_counting.py',*common,
             '--output',W/'llmdet_eval','--eval-only'])
     else:
         status('gradient_smoke')
-        run([sys.executable,'-u','tools/train_llmdet_counting.py',*common,'--output',W/'gradient_smoke','--smoke'])
+        run([sys.executable,'-u','tools/train_llmdet_counting.py',*common,
+            '--lr',str(SPEC['lr']),'--exemplar-lr',str(SPEC['exemplar_lr']),
+            '--output',W/'gradient_smoke','--smoke'])
         status('training_and_validation')
         run([sys.executable,'-u','tools/train_llmdet_counting.py',*common,
+            '--lr',str(SPEC['lr']),'--exemplar-lr',str(SPEC['exemplar_lr']),
             '--output',W/'llmdet_counting','--epochs',str(SPEC['epochs']),
-            '--step-size',str(SPEC['step_size']),'--accumulate',str(SPEC['accumulate'])])
+            '--accumulate',str(SPEC['accumulate'])])
     status('complete')
 except BaseException as exc:
     status('failed',error=f'{type(exc).__name__}: {exc}');traceback.print_exc();raise
@@ -74,24 +78,25 @@ except BaseException as exc:
 MODE_META = {
     'eval': (
         'countyolo-llmdet-eval-20261121',
-        'Step 1: Full-Val (raw + 2x2 tiled), Pilot-58, and Absent evaluation of trained LLMDet checkpoint',
+        'Full-Val (raw + 2x2 tiled), Pilot-58, and Absent evaluation of trained LLMDet checkpoint',
         False,
     ),
     'text_mc': (
-        'countyolo-llmdet-text-mc-20261121',
-        'Step 2: Text-only LLMDet with 40-class single-forward negative captioning + 7-layer CountGD-Box loss + 2x2 tiling',
+        'countyolo-llmdet-text-v3-20261121',
+        'LLMDet v3 Text-Only: differentiable 7-stage bbox+encoder+cls grads, balanced 8-class negatives, lr=2e-5 warmup+cosine',
         False,
     ),
     'multimodal': (
-        'countyolo-llmdet-multimodal-20261121',
-        'Step 3: Multimodal LLMDet with ROIAlign visual exemplar injection + 40-class negative captioning + 7-layer loss + 2x2 tiling',
+        'countyolo-llmdet-multimodal-v3-20261121',
+        'LLMDet v3 Multimodal: differentiable 7-stage grads, normalized ROIAlign exemplars (50/50), balanced 8-class negatives, lr=2e-5/1e-4 warmup+cosine',
         True,
     ),
 }
 
 
 def prepare(user='thiend27', mode='text_mc', model_id='iSEE-Laboratory/llmdet_tiny',
-            epochs=14, step_size=9, max_classes=40, tile_trigger=600, init_kernel=None, init_dataset=None):
+            epochs=14, lr=2e-5, exemplar_lr=1e-4, max_classes=8, neg_class_weight=1.0,
+            exemplar_prob=0.5, tile_trigger=600, init_kernel=None, init_dataset=None):
     slug, purpose, use_exemplars = MODE_META[mode]
     folder = ROOT / 'kaggle_video_run' / user / slug
     folder.mkdir(parents=True, exist_ok=True)
@@ -100,12 +105,13 @@ def prepare(user='thiend27', mode='text_mc', model_id='iSEE-Laboratory/llmdet_ti
         purpose=purpose,
         model_id=model_id,
         epochs=epochs,
-        step_size=step_size,
         accumulate=4,
-        lr=1e-4,
+        lr=lr,
+        exemplar_lr=exemplar_lr,
         max_classes=max_classes,
+        neg_class_weight=neg_class_weight,
         use_exemplars=use_exemplars,
-        exemplar_prob=0.7,
+        exemplar_prob=exemplar_prob,
         tile_trigger=tile_trigger,
         init_kernel=init_kernel,
         init_dataset=init_dataset,
@@ -157,8 +163,11 @@ def main():
     p.add_argument('--mode', choices=sorted(MODE_META), default='text_mc')
     p.add_argument('--model-id', default='iSEE-Laboratory/llmdet_tiny')
     p.add_argument('--epochs', type=int, default=14)
-    p.add_argument('--step-size', type=int, default=9)
-    p.add_argument('--max-classes', type=int, default=40)
+    p.add_argument('--lr', type=float, default=2e-5)
+    p.add_argument('--exemplar-lr', type=float, default=1e-4)
+    p.add_argument('--max-classes', type=int, default=8)
+    p.add_argument('--neg-class-weight', type=float, default=1.0)
+    p.add_argument('--exemplar-prob', type=float, default=0.5)
     p.add_argument('--tile-trigger', type=int, default=600)
     p.add_argument('--init-kernel', default=None, help='Kaggle kernel ref whose best.pth will be attached')
     p.add_argument('--init-dataset', default=None, help='Kaggle dataset ref containing best.pth')
@@ -166,10 +175,12 @@ def main():
     a = p.parse_args()
     job = prepare(
         user=a.user, mode=a.mode, model_id=a.model_id,
-        epochs=a.epochs, step_size=a.step_size, max_classes=a.max_classes,
-        tile_trigger=a.tile_trigger, init_kernel=a.init_kernel, init_dataset=a.init_dataset,
+        epochs=a.epochs, lr=a.lr, exemplar_lr=a.exemplar_lr,
+        max_classes=a.max_classes, neg_class_weight=a.neg_class_weight,
+        exemplar_prob=a.exemplar_prob, tile_trigger=a.tile_trigger,
+        init_kernel=a.init_kernel, init_dataset=a.init_dataset,
     )
-    ledger = ROOT / f'experiments/llmdet_{a.mode}_kaggle_20261121_{a.user}.json'
+    ledger = ROOT / f'experiments/llmdet_{a.mode}_v3_kaggle_20261121_{a.user}.json'
     ledger.write_text(json.dumps(job, indent=2), encoding='utf-8')
     if a.push:
         ver, remote_state = push_with_retry(a.user, job)

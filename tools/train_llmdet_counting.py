@@ -1,9 +1,10 @@
-"""Train & evaluate LLMDet (`iSEE-Laboratory/llmdet_tiny` / `llmdet_base`) with 7-layer CountGD-Box
-deep supervision, single-forward multi-class negative captioning, optional ROIAlign visual exemplars,
-and adaptive 2x2 dense-image tiling (100% NMS-free).
+"""Train & evaluate LLMDet (`iSEE-Laboratory/llmdet_tiny` / `llmdet_base`) with differentiable
+7-layer CountGD-Box deep supervision, balanced multi-class negative captioning, optional ROIAlign
+visual exemplars, differential warmup+cosine LR schedule, and adaptive 2x2 dense tiling (100% NMS-free).
 """
 import argparse
 import json
+import math
 from pathlib import Path
 import random
 import sys
@@ -52,7 +53,6 @@ def prepare_llmdet_sample(image: Image.Image, record: dict, short=640, max_size=
     if len(boxes):
         boxes = boxes / np.array([w, h, w, h], dtype=np.float32)
 
-    # Deformable DETR has 900 queries; subsample >900 GT points in train while keeping exemplar targets.
     if len(supervision_points) > max_queries:
         ex_idx, _ = exemplar_point_indices(supervision_points, boxes)
         keep_set = set(ex_idx.tolist())
@@ -95,24 +95,43 @@ class LLMDetData:
         return sample
 
 
-def compute_7layer_loss(criterion: CountingCriterion, stage_out: dict, sample: dict, device: str, aux_weight=1.0):
+def compute_7layer_loss(criterion: CountingCriterion, stage_out: dict, sample: dict, device: str,
+                        aux_weight=1.0, neg_class_weight=1.0):
     """Compute final decoder loss + 5 intermediate decoder losses + 1 encoder proposal loss."""
     sup_pts = sample['supervision_points'].to(device)
     ex_idx = sample['exemplar_indices'].to(device)
     ex_box = sample['exemplar_boxes'].to(device)
     t_mask = stage_out['target_tokens'].to(device)
 
-    total_loss, parts = criterion(stage_out['boxes'], stage_out['logits'], sup_pts, ex_idx, ex_box, target_tokens=t_mask)
+    total_loss, parts = criterion(
+        stage_out['boxes'], stage_out['logits'], sup_pts, ex_idx, ex_box,
+        target_tokens=t_mask, neg_class_weight=neg_class_weight)
     aux_count = 0
     for abox, alog in zip(stage_out['aux_boxes'], stage_out['aux_logits']):
-        l_aux, _ = criterion(abox, alog, sup_pts, ex_idx, ex_box, target_tokens=t_mask)
+        l_aux, _ = criterion(abox, alog, sup_pts, ex_idx, ex_box,
+                             target_tokens=t_mask, neg_class_weight=neg_class_weight)
         total_loss = total_loss + aux_weight * l_aux
         aux_count += 1
     if stage_out['enc_boxes'] is not None and stage_out['enc_logits'] is not None:
-        l_enc, _ = criterion(stage_out['enc_boxes'], stage_out['enc_logits'], sup_pts, ex_idx, ex_box, target_tokens=t_mask)
+        l_enc, _ = criterion(stage_out['enc_boxes'], stage_out['enc_logits'], sup_pts, ex_idx, ex_box,
+                             target_tokens=t_mask, neg_class_weight=neg_class_weight)
         total_loss = total_loss + aux_weight * l_enc
         aux_count += 1
     return total_loss / (1.0 + aux_weight * aux_count), parts
+
+
+def make_warmup_cosine_scheduler(optimizer, total_steps: int, warmup_steps: int = 400, min_lr_ratio: float = 0.1):
+    """Linear warmup from min_lr_ratio -> 1.0, then smooth cosine decay back to min_lr_ratio."""
+    total_steps = max(1, total_steps)
+    warmup_steps = min(warmup_steps, max(1, total_steps // 4))
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return min_lr_ratio + (1.0 - min_lr_ratio) * (step / max(1, warmup_steps))
+        progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+        return min_lr_ratio + 0.5 * (1.0 - min_lr_ratio) * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 @torch.no_grad()
@@ -127,7 +146,6 @@ def predict_with_tiling(model: LLMDetCounting, pil_image: Image.Image, prompt: s
     if tile_trigger <= 0 or int((scores > threshold).sum().item()) < tile_trigger:
         return boxes, scores
 
-    # Dense image detected: split into 4 quadrants and reuse global exemplar embeddings if enabled.
     ex_feats = None
     if model.use_exemplars and exemplar_boxes is not None and len(exemplar_boxes) > 0:
         with torch.autocast('cuda', dtype=torch.float16, enabled=use_amp):
@@ -194,12 +212,13 @@ def main():
     p.add_argument('--model-id', type=str, default='iSEE-Laboratory/llmdet_tiny')
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--epochs', type=int, default=14)
-    p.add_argument('--step-size', type=int, default=9)
     p.add_argument('--accumulate', type=int, default=4)
-    p.add_argument('--lr', type=float, default=1e-4)
-    p.add_argument('--max-classes', type=int, default=40, help='Total classes per single-forward caption (1 pos + K-1 neg)')
+    p.add_argument('--lr', type=float, default=2e-5, help='Gentle LR for pretrained LLMDet encoder/decoder/heads')
+    p.add_argument('--exemplar-lr', type=float, default=1e-4, help='Higher LR for newly initialized exemplar_proj head')
+    p.add_argument('--max-classes', type=int, default=8, help='Total classes per single-forward caption (1 pos + K-1 neg)')
+    p.add_argument('--neg-class-weight', type=float, default=1.0, help='Balanced total negative weight across all K-1 negative classes')
     p.add_argument('--use-exemplars', action='store_true', help='Enable ROIAlign visual exemplar injection')
-    p.add_argument('--exemplar-prob', type=float, default=0.7, help='Probability of injecting exemplars during training')
+    p.add_argument('--exemplar-prob', type=float, default=0.5, help='Probability of injecting exemplars during training')
     p.add_argument('--tile-trigger', type=int, default=600, help='Trigger 2x2 adaptive tiling when raw count >= trigger (0 disables)')
     p.add_argument('--init', type=Path, help='Optional checkpoint (best.pth) to initialize weights from')
     p.add_argument('--eval-only', action='store_true', help='Skip training and run full evaluation on --init checkpoint')
@@ -248,17 +267,18 @@ def main():
         architecture=model.ARCHITECTURE,
         model_id=a.model_id,
         epochs=a.epochs,
-        step_size=a.step_size,
         accumulate=a.accumulate,
         lr=a.lr,
+        exemplar_lr=a.exemplar_lr,
         max_classes=a.max_classes,
+        neg_class_weight=a.neg_class_weight,
         use_exemplars=a.use_exemplars,
         exemplar_prob=a.exemplar_prob,
         tile_trigger=a.tile_trigger,
         init=str(a.init) if a.init else None,
         eval_only=a.eval_only,
         trainable_parameters=sum(p.numel() for _, p in trainable),
-        supervision='7-layer CountGD-Box deep supervision (1 Encoder + 5 Aux Decoder + 1 Final Decoder)',
+        supervision='Differentiable 7-layer CountGD-Box deep supervision (1 Two-Stage Encoder + 6 Decoder bbox/cls stages)',
         fsc147d_prompts=True,
         nms_free=True,
     )
@@ -289,12 +309,13 @@ def main():
             model, val, ['1919.jpg', '3436.jpg'], device, a.output / 'eval_absent.json',
             absent=True, use_exemplars=False, tile_trigger=0)['summary']
         save(a.output / 'result.json', res)
-        print('eval_only complete', json.dumps({k: v.get('0.23') if isinstance(v, dict) and '0.23' in v else v for k, v in res.items()}), flush=True)
+        print('eval_only complete', flush=True)
         return
 
     criterion = CountingCriterion()
-    optimizer = torch.optim.AdamW([p for _, p in trainable], lr=a.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=a.step_size, gamma=0.1)
+    optimizer = torch.optim.AdamW(model.parameter_groups(base_lr=a.lr, exemplar_lr=a.exemplar_lr, weight_decay=1e-4))
+    steps_per_epoch = math.ceil(len(train.names) / a.accumulate)
+    scheduler = make_warmup_cosine_scheduler(optimizer, total_steps=a.epochs * steps_per_epoch, warmup_steps=min(450, steps_per_epoch // 2))
     use_amp = (device == 'cuda') and not a.no_amp
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
@@ -311,13 +332,19 @@ def main():
                     inputs['pixel_values'], inputs.get('pixel_mask'),
                     inputs['input_ids'], inputs['attention_mask'], inputs.get('token_type_ids'),
                     target_phrase_idx=target_idx, exemplar_boxes=ex_boxes)
-            loss, _ = compute_7layer_loss(criterion, st, sample, device)
+            loss, _ = compute_7layer_loss(criterion, st, sample, device, neg_class_weight=a.neg_class_weight)
             assert torch.isfinite(loss)
             scaler.scale(loss / 2.0).backward()
+        # Verify real gradient flow to BOTH decoder bbox_embed AND encoder proposal heads!
+        assert any(p.grad is not None and p.grad.abs().sum().item() > 0 for p in model.detector.bbox_embed.parameters()), 'bbox_embed received zero grad'
+        assert any(p.grad is not None and p.grad.abs().sum().item() > 0 for p in model.detector.model.encoder_output_bbox_embed.parameters()), 'encoder_output_bbox_embed received zero grad'
+        if a.use_exemplars:
+            assert any(p.grad is not None and p.grad.abs().sum().item() > 0 for p in model.exemplar_proj.parameters()), 'exemplar_proj received zero grad'
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_([p for _, p in trainable], 0.1)
         scaler.step(optimizer)
         scaler.update()
+        scheduler.step()
         model.set_training(False)
         with torch.no_grad():
             b, s = predict_with_tiling(model, sample['pil_image'], sample['prompt'],
@@ -326,7 +353,7 @@ def main():
         assert b.shape == (900, 4) and s.shape == (900,)
         save(a.output / 'smoke.json', dict(passed=True, loss=float(loss.detach()), queries=len(b), stages=7,
                                            max_classes=a.max_classes, use_exemplars=a.use_exemplars))
-        print('llmdet smoke passed', float(loss.detach()), flush=True)
+        print('llmdet v3 smoke passed (all 7 bbox+cls+encoder+exemplar gradients verified)', float(loss.detach()), flush=True)
         return
 
     evaluate_llmdet(model, val, dev, device, a.output / 'baseline_dev.json', use_exemplars=a.use_exemplars)
@@ -337,7 +364,7 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         names = list(train.names)
         random.shuffle(names)
-        losses = []
+        losses, cls_losses, ctr_losses = [], [], []
         for i, name in enumerate(names):
             sample = train.get(name, augment=True)
             caption, target_idx = build_multiclass_caption(sample['prompt'], train_vocab, max_classes=a.max_classes)
@@ -349,7 +376,7 @@ def main():
                     inputs['pixel_values'], inputs.get('pixel_mask'),
                     inputs['input_ids'], inputs['attention_mask'], inputs.get('token_type_ids'),
                     target_phrase_idx=target_idx, exemplar_boxes=ex_boxes)
-            loss, _ = compute_7layer_loss(criterion, st, sample, device)
+            loss, parts = compute_7layer_loss(criterion, st, sample, device, neg_class_weight=a.neg_class_weight)
             if not torch.isfinite(loss):
                 raise FloatingPointError(f'Non-finite loss on {name}')
             group_start = (i // a.accumulate) * a.accumulate
@@ -360,18 +387,32 @@ def main():
                 torch.nn.utils.clip_grad_norm_([p for _, p in trainable], 0.1)
                 scaler.step(optimizer)
                 scaler.update()
+                scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
             losses.append(float(loss.detach()))
+            cls_losses.append(float(parts['cls']))
+            ctr_losses.append(float(parts['center']))
             del st, loss, inputs
             if (i + 1) % 100 == 0:
                 torch.cuda.empty_cache()
-                save(a.output / 'progress.json', dict(epoch=epoch, images=i + 1, total=len(names), mean_loss=float(np.mean(losses))))
-                print('train', epoch, i + 1, len(names), 'loss', round(float(np.mean(losses)), 4), flush=True)
-        scheduler.step()
+                save(a.output / 'progress.json', dict(epoch=epoch, images=i + 1, total=len(names),
+                                                      mean_loss=float(np.mean(losses)),
+                                                      cls_loss=float(np.mean(cls_losses)),
+                                                      center_loss=float(np.mean(ctr_losses)),
+                                                      lr=optimizer.param_groups[0]['lr']))
+                print(f"train {epoch} {i+1} {len(names)} loss {round(float(np.mean(losses)), 4)} "
+                      f"cls {round(float(np.mean(cls_losses)), 4)} ctr {round(float(np.mean(ctr_losses)), 4)} "
+                      f"lr {optimizer.param_groups[0]['lr']:.2e}", flush=True)
+
         res = evaluate_llmdet(model, val, dev, device, a.output / f'dev_epoch{epoch:02d}.json', use_exemplars=a.use_exemplars)
+        res_abs = evaluate_llmdet(model, val, ['1919.jpg', '3436.jpg'], device, a.output / f'absent_epoch{epoch:02d}.json',
+                                  absent=True, use_exemplars=False)
         mae = res['summary']['0.23']['mae']
         best_th_mae = min(res['summary'][str(t)]['mae'] for t in THRESHOLDS)
-        entry = dict(epoch=epoch, loss=float(np.mean(losses)), dev_mae=mae, dev_best_th_mae=best_th_mae)
+        absent_mae = res_abs['summary']['0.23']['mae']
+        entry = dict(epoch=epoch, loss=float(np.mean(losses)), cls_loss=float(np.mean(cls_losses)),
+                     center_loss=float(np.mean(ctr_losses)), dev_mae=mae, dev_best_th_mae=best_th_mae,
+                     absent_mae=absent_mae)
         if a.use_exemplars:
             res_txt = evaluate_llmdet(model, val, dev, device, a.output / f'dev_text_epoch{epoch:02d}.json', use_exemplars=False)
             entry['dev_text_mae'] = res_txt['summary']['0.23']['mae']
@@ -382,7 +423,8 @@ def main():
             best = mae
             torch.save(dict(trainable=model.export_trainable_state(), epoch=epoch, dev_mae=best, manifest=manifest), a.output / 'best.pth')
         extra_str = f" text_mae {round(entry['dev_text_mae'], 3)}" if 'dev_text_mae' in entry else ''
-        print(f'epoch {epoch} dev_mae {round(mae, 3)}{extra_str} best_th_mae {round(best_th_mae, 3)} best {round(best, 3)}', flush=True)
+        print(f"epoch {epoch} dev_mae {round(mae, 3)}{extra_str} best_th_mae {round(best_th_mae, 3)} "
+              f"absent {round(absent_mae, 1)} best {round(best, 3)}", flush=True)
 
     best_state = torch.load(a.output / 'best.pth', map_location='cpu', weights_only=False)
     model.import_trainable_state(best_state['trainable'])

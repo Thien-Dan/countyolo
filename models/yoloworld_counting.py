@@ -38,7 +38,8 @@ class CountingCriterion(nn.Module):
         self.loc, self.giou, self.cls = loc, giou, cls
 
     def forward(self, boxes, logits, points, exemplar_indices, exemplar_xyxy, target_tokens=None,
-                anchor_xy=None, anchor_strides=None, max_stride_radius=4.0, neighbor_sigma=0.0):
+                anchor_xy=None, anchor_strides=None, max_stride_radius=4.0, neighbor_sigma=0.0,
+                neg_class_weight=1.0):
         assert boxes.ndim == 2 and boxes.shape[1] == 4
         assert logits.shape[0] == boxes.shape[0] and logits.ndim in (1,2)
         if logits.ndim==2:
@@ -71,6 +72,13 @@ class CountingCriterion(nn.Module):
                     neg_weight = neg_weight[:, None]
             else:
                 neg_weight = 1.0
+            if logits.ndim == 2 and (~target_tokens).any():
+                # Balance negative-class token pressure so K negative classes do not overwhelm target-class logits.
+                num_pos_tok = max(1, int(target_tokens.sum().item()))
+                num_neg_tok = max(1, int((~target_tokens).sum().item()))
+                tok_neg_scale = torch.ones((1, logits.shape[1]), device=logits.device, dtype=torch.float32)
+                tok_neg_scale[:, ~target_tokens] = float(neg_class_weight) * min(1.0, num_pos_tok / num_neg_tok)
+                neg_weight = neg_weight * tok_neg_scale
         target = torch.zeros_like(logits, dtype=torch.float32)
         if logits.ndim==1:target[pred_ids] = 1
         else:target[pred_ids[:,None],torch.where(target_tokens)[0][None,:]]=1
