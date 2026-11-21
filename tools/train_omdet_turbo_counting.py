@@ -1,6 +1,8 @@
-"""Train & evaluate OmDet-Turbo (`omlab/omdet-turbo-swin-tiny-hf`) with 7-layer CountGD-Box
-deep supervision, balanced multi-class negative classes, optional Dual-Path ROIAlign visual
-exemplar injection, FrozenBN stability, warmup+cosine LR schedule, and adaptive 2x2 tiling.
+"""Train & evaluate OmDet-Turbo v2 (`omlab/omdet-turbo-swin-tiny-hf`) with:
+- Frozen CLIP class projection heads (prevents 89-class FSC-147 overfitting)
+- Class-Agnostic Direct Visual Matching + Spatial Sim-Map before Two-Stage Encoder
+- 3-mode Modality Dropout (33% Exemplar-Only / 33% Text+Exemplar / 33% Text-Only)
+- 7-layer differentiable CountGD-Box deep supervision, FrozenBN, warmup+cosine LR, and 2x2 tiling.
 """
 import argparse
 import json
@@ -44,7 +46,6 @@ def prepare_omdet_sample(image: Image.Image, record: dict, flip=False, crop_scal
         if len(boxes):
             boxes[:, [0, 2]] = w - boxes[:, [2, 0]]
 
-    # Optional scale/crop augmentation that preserves all exemplar boxes & keeps valid GT points
     if crop_scale_range is not None and len(supervision_points) > 1:
         lo, hi = crop_scale_range
         scale = random.uniform(lo, hi)
@@ -134,11 +135,12 @@ class OmDetData:
 
 @torch.no_grad()
 def predict_with_tiling(model: OmDetTurboCounting, pil_image: Image.Image, prompt: str,
-                        exemplar_boxes=None, threshold: float = 0.23, tile_trigger: int = 600):
-    """Run NMS-free OmDet-Turbo inference with optional 2x2 adaptive quadrant tiling."""
+                        exemplar_boxes=None, use_text: bool = True,
+                        threshold: float = 0.23, tile_trigger: int = 600):
+    """Run NMS-free OmDet-Turbo v2 inference with optional 2x2 adaptive quadrant tiling."""
     use_amp = torch.cuda.is_available()
     with torch.autocast('cuda', dtype=torch.float16, enabled=use_amp):
-        boxes, logits = model(pil_image, prompt, exemplar_boxes=exemplar_boxes)
+        boxes, logits = model(pil_image, prompt, exemplar_boxes=exemplar_boxes, use_text=use_text)
     boxes = boxes.float().cpu()
     scores = logits.float().sigmoid().cpu()
     if tile_trigger <= 0 or int((scores > threshold).sum().item()) < tile_trigger:
@@ -161,7 +163,7 @@ def predict_with_tiling(model: OmDetTurboCounting, pil_image: Image.Image, promp
     for x0, y0, x1, y1, ox, oy, sw, sh in quads:
         crop = pil_image.crop((x0, y0, x1, y1))
         with torch.autocast('cuda', dtype=torch.float16, enabled=use_amp):
-            qb, ql = model(crop, prompt, exemplar_feats=ex_feats)
+            qb, ql = model(crop, prompt, exemplar_feats=ex_feats, use_text=use_text)
         qb = qb.float().cpu()
         qs = ql.float().sigmoid().cpu()
         qb[:, 0] = ox + qb[:, 0] * sw
@@ -175,15 +177,17 @@ def predict_with_tiling(model: OmDetTurboCounting, pil_image: Image.Image, promp
 
 @torch.no_grad()
 def evaluate_omdet(model: OmDetTurboCounting, dataset: OmDetData, names, device: str, output: Path,
-                   absent=False, use_exemplars=False, tile_trigger=0):
+                   absent=False, use_exemplars=False, use_text=True, tile_trigger=0):
     model.set_training(False)
     rows = []
     for i, name in enumerate(names):
         sample = dataset.get(name, augment=False)
         prompt = 'elephant' if absent else sample['prompt']
         ex_boxes = sample['exemplar_boxes'] if (use_exemplars and not absent and len(sample['exemplar_boxes'])) else None
+        effective_use_text = True if (absent or ex_boxes is None) else use_text
         boxes, scores = predict_with_tiling(
-            model, sample['pil_image'], prompt, exemplar_boxes=ex_boxes, tile_trigger=tile_trigger)
+            model, sample['pil_image'], prompt, exemplar_boxes=ex_boxes,
+            use_text=effective_use_text, tile_trigger=tile_trigger)
         scale = boxes.new_tensor([640.0, 640.0, 640.0, 640.0])
         xyxy = xywh_to_xyxy(boxes) * scale
         centers = ((xyxy[:, :2] + xyxy[:, 2:]) / 2.0).numpy()
@@ -209,13 +213,13 @@ def main():
     p.add_argument('--epochs', type=int, default=20)
     p.add_argument('--accumulate', type=int, default=4)
     p.add_argument('--lr', type=float, default=3e-5, help='Gentle LR for pretrained OmDet-Turbo encoder/decoder')
-    p.add_argument('--exemplar-lr', type=float, default=1.5e-4, help='Higher LR for newly initialized exemplar modules')
-    p.add_argument('--max-classes', type=int, default=8, help='Classes per forward (1 pos + K-1 neg)')
-    p.add_argument('--neg-class-weight', type=float, default=1.0, help='Balanced total weight on negative classes')
-    p.add_argument('--use-exemplars', action='store_true', help='Enable Dual-Path ROIAlign visual exemplar injection')
-    p.add_argument('--exemplar-prob', type=float, default=0.5, help='Modality dropout probability for exemplars')
-    p.add_argument('--tile-trigger', type=int, default=600, help='Trigger 2x2 adaptive tiling when raw count >= trigger')
-    p.add_argument('--init', type=Path, help='Optional checkpoint (best.pth) to initialize weights from')
+    p.add_argument('--exemplar-lr', type=float, default=1.5e-4, help='Higher LR for newly initialized visual matching heads')
+    p.add_argument('--max-classes', type=int, default=8, help='Classes per forward when text is active')
+    p.add_argument('--neg-class-weight', type=float, default=0.5, help='Balanced negative weight on non-target CLIP classes')
+    p.add_argument('--use-exemplars', action='store_true', help='Enable Class-Agnostic Visual Exemplar Matching')
+    p.add_argument('--unfreeze-class-heads', action='store_true', help='Disable freezing of CLIP class projection heads')
+    p.add_argument('--tile-trigger', type=int, default=600)
+    p.add_argument('--init', type=Path)
     p.add_argument('--eval-only', action='store_true')
     p.add_argument('--no-amp', action='store_true')
     p.add_argument('--dev-per-class', type=int, default=8)
@@ -248,7 +252,11 @@ def main():
         dev.extend(g[:a.dev_per_class])
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = OmDetTurboCounting(a.model_id, device=device, freeze_backbones=True, use_exemplars=a.use_exemplars)
+    freeze_class_heads = not a.unfreeze_class_heads
+    model = OmDetTurboCounting(
+        a.model_id, device=device, freeze_backbones=True,
+        freeze_class_heads=freeze_class_heads, use_exemplars=a.use_exemplars,
+    )
     if a.init and a.init.exists():
         ckpt = torch.load(a.init, map_location='cpu', weights_only=False)
         model.import_trainable_state(ckpt['trainable'] if 'trainable' in ckpt else ckpt)
@@ -268,13 +276,12 @@ def main():
         max_classes=a.max_classes,
         neg_class_weight=a.neg_class_weight,
         use_exemplars=a.use_exemplars,
-        exemplar_prob=a.exemplar_prob,
+        freeze_class_heads=freeze_class_heads,
+        modality_dropout='33% exemplar-only / 33% multimodal / 33% text-only' if a.use_exemplars else '100% text-only',
         tile_trigger=a.tile_trigger,
         init=str(a.init) if a.init else None,
         eval_only=a.eval_only,
         trainable_parameters=sum(p.numel() for _, p in trainable),
-        supervision='Differentiable 7-layer CountGD-Box deep supervision on RT-DETR HybridEncoder + 6-layer Task-Conditioned Decoder',
-        fsc147d_prompts=True,
         nms_free=True,
     )
     save(a.output / 'manifest.json', manifest)
@@ -283,23 +290,22 @@ def main():
         res = dict(state='complete', mode='eval_only', init=str(a.init) if a.init else None)
         res['fullval_text_raw'] = evaluate_omdet(
             model, val, val.names, device, a.output / 'eval_fullval_text_raw.json',
-            use_exemplars=False, tile_trigger=0)['summary']
-        if a.tile_trigger > 0:
-            res['fullval_text_tiled'] = evaluate_omdet(
-                model, val, val.names, device, a.output / 'eval_fullval_text_tiled.json',
-                use_exemplars=False, tile_trigger=a.tile_trigger)['summary']
+            use_exemplars=False, use_text=True, tile_trigger=0)['summary']
         if a.use_exemplars:
-            res['fullval_ex_raw'] = evaluate_omdet(
-                model, val, val.names, device, a.output / 'eval_fullval_ex_raw.json',
-                use_exemplars=True, tile_trigger=0)['summary']
+            res['fullval_mm_raw'] = evaluate_omdet(
+                model, val, val.names, device, a.output / 'eval_fullval_mm_raw.json',
+                use_exemplars=True, use_text=True, tile_trigger=0)['summary']
+            res['fullval_ex_only_raw'] = evaluate_omdet(
+                model, val, val.names, device, a.output / 'eval_fullval_ex_only_raw.json',
+                use_exemplars=True, use_text=False, tile_trigger=0)['summary']
             if a.tile_trigger > 0:
-                res['fullval_ex_tiled'] = evaluate_omdet(
-                    model, val, val.names, device, a.output / 'eval_fullval_ex_tiled.json',
-                    use_exemplars=True, tile_trigger=a.tile_trigger)['summary']
+                res['fullval_mm_tiled'] = evaluate_omdet(
+                    model, val, val.names, device, a.output / 'eval_fullval_mm_tiled.json',
+                    use_exemplars=True, use_text=True, tile_trigger=a.tile_trigger)['summary']
         if pilot:
             res['pilot58'] = evaluate_omdet(
                 model, val, pilot, device, a.output / 'eval_pilot58.json',
-                use_exemplars=a.use_exemplars, tile_trigger=a.tile_trigger)['summary']
+                use_exemplars=a.use_exemplars, use_text=True, tile_trigger=a.tile_trigger)['summary']
         res['absent'] = evaluate_omdet(
             model, val, ['1919.jpg', '3436.jpg'], device, a.output / 'eval_absent.json',
             absent=True, use_exemplars=False, tile_trigger=0)['summary']
@@ -317,9 +323,14 @@ def main():
     if a.smoke:
         model.set_training(True)
         optimizer.zero_grad(set_to_none=True)
-        for name in train.names[:2]:
+        # Test BOTH Exemplar-Only (step 0) and Multimodal (step 1) when use_exemplars=True
+        for idx_s, name in enumerate(train.names[:2]):
             sample = train.get(name, augment=True)
-            classes, task, target_idx = build_omdet_class_list(sample['prompt'], train_vocab, max_classes=a.max_classes)
+            use_txt = (idx_s == 1) or (not a.use_exemplars)
+            if use_txt:
+                classes, task, target_idx = build_omdet_class_list(sample['prompt'], train_vocab, max_classes=a.max_classes)
+            else:
+                classes, task, target_idx = ['object'], 'Detect object.', 0
             inputs = model.processor(images=sample['pil_image'], text=classes, task=task, return_tensors='pt').to(device)
             ex_boxes = sample['exemplar_boxes'] if (a.use_exemplars and len(sample['exemplar_boxes'])) else None
             with torch.autocast('cuda', dtype=torch.float16, enabled=use_amp):
@@ -332,6 +343,7 @@ def main():
                     inputs['classes_structure'],
                     target_idx=target_idx,
                     exemplar_boxes=ex_boxes,
+                    use_text=use_txt,
                 )
             loss, _ = compute_7layer_loss(criterion, st, sample, device, neg_class_weight=a.neg_class_weight)
             assert torch.isfinite(loss), f'Non-finite loss: {loss}'
@@ -339,22 +351,24 @@ def main():
         scaler.unscale_(optimizer)
         enc_g = sum(p.grad.abs().sum().item() for p in model.detector.encoder.parameters() if p.grad is not None)
         dec_b_g = sum(p.grad.abs().sum().item() for p in model.detector.decoder.decoder_bbox_head.parameters() if p.grad is not None)
-        dec_c_g = sum(p.grad.abs().sum().item() for p in model.detector.decoder.decoder_class_head.parameters() if p.grad is not None)
         enc_b_g = sum(p.grad.abs().sum().item() for p in model.detector.decoder.encoder_bbox_head.parameters() if p.grad is not None)
         assert math.isfinite(enc_g) and enc_g > 0, f'encoder bad grad: {enc_g}'
         assert math.isfinite(dec_b_g) and dec_b_g > 0, f'decoder_bbox_head bad grad: {dec_b_g}'
-        assert math.isfinite(dec_c_g) and dec_c_g > 0, f'decoder_class_head bad grad: {dec_c_g}'
         assert math.isfinite(enc_b_g) and enc_b_g > 0, f'encoder_bbox_head bad grad: {enc_b_g}'
+        if freeze_class_heads:
+            assert all(p.grad is None for p in model.detector.decoder.decoder_class_head.parameters()), 'class_head must stay frozen'
         ex_msg = ''
         if a.use_exemplars:
             ex_p_g = sum(p.grad.abs().sum().item() for p in model.exemplar_proj.parameters() if p.grad is not None)
-            ex_pr_g = sum(p.grad.abs().sum().item() for p in model.exemplar_proto_head.parameters() if p.grad is not None)
-            ex_gt_g = model.exemplar_cls_gate.grad.abs().sum().item() if model.exemplar_cls_gate.grad is not None else 0.0
+            sim_g = sum(p.grad.abs().sum().item() for p in model.sim_fusion_convs.parameters() if p.grad is not None)
+            vq_g = sum(p.grad.abs().sum().item() for p in model.vis_query_head.parameters() if p.grad is not None)
+            ve_g = sum(p.grad.abs().sum().item() for p in model.vis_ex_head.parameters() if p.grad is not None)
             assert math.isfinite(ex_p_g) and ex_p_g > 0, f'exemplar_proj bad grad: {ex_p_g}'
-            assert math.isfinite(ex_pr_g) and ex_pr_g > 0, f'exemplar_proto_head bad grad: {ex_pr_g}'
-            assert math.isfinite(ex_gt_g) and ex_gt_g > 0, f'exemplar_cls_gate bad grad: {ex_gt_g}'
-            ex_msg = f' ex_proj={ex_p_g:.4f} ex_proto={ex_pr_g:.4f} ex_gate={ex_gt_g:.4f}'
-        print(f'omdet smoke grad sums: enc={enc_g:.4f} enc_bbox={enc_b_g:.4f} dec_bbox={dec_b_g:.4f} dec_cls={dec_c_g:.4f}{ex_msg}', flush=True)
+            assert math.isfinite(sim_g) and sim_g > 0, f'sim_fusion_convs bad grad: {sim_g}'
+            assert math.isfinite(vq_g) and vq_g > 0, f'vis_query_head bad grad: {vq_g}'
+            assert math.isfinite(ve_g) and ve_g > 0, f'vis_ex_head bad grad: {ve_g}'
+            ex_msg = f' ex_proj={ex_p_g:.4f} sim={sim_g:.4f} vis_q={vq_g:.4f} vis_e={ve_g:.4f}'
+        print(f'omdet v2 smoke grad sums: enc={enc_g:.4f} enc_bbox={enc_b_g:.4f} dec_bbox={dec_b_g:.4f}{ex_msg}', flush=True)
         torch.nn.utils.clip_grad_norm_([p for _, p in trainable], 0.1)
         scaler.step(optimizer)
         scaler.update()
@@ -366,11 +380,11 @@ def main():
                 exemplar_boxes=sample['exemplar_boxes'] if a.use_exemplars else None, tile_trigger=0)
         assert b.shape == (model.num_queries, 4) and s.shape == (model.num_queries,)
         save(a.output / 'smoke.json', dict(passed=True, loss=float(loss.detach()), queries=len(b), stages=7,
-                                           max_classes=a.max_classes, use_exemplars=a.use_exemplars))
-        print('omdet-turbo smoke passed', float(loss.detach()), flush=True)
+                                           freeze_class_heads=freeze_class_heads, use_exemplars=a.use_exemplars))
+        print('omdet-turbo v2 smoke passed', float(loss.detach()), flush=True)
         return
 
-    evaluate_omdet(model, val, dev, device, a.output / 'baseline_dev.json', use_exemplars=a.use_exemplars)
+    evaluate_omdet(model, val, dev, device, a.output / 'baseline_dev.json', use_exemplars=a.use_exemplars, use_text=True)
     history = []
     best = float('inf')
     for epoch in range(1, a.epochs + 1):
@@ -381,10 +395,25 @@ def main():
         losses, cls_losses, ctr_losses = [], [], []
         for i, name in enumerate(names):
             sample = train.get(name, augment=True)
-            classes, task, target_idx = build_omdet_class_list(sample['prompt'], train_vocab, max_classes=a.max_classes)
+            has_ex = a.use_exemplars and len(sample['exemplar_boxes']) > 0
+            if has_ex:
+                # 3-mode Modality Dropout: 33% Exemplar-Only, 33% Text+Exemplar, 33% Text-Only
+                r = random.random()
+                if r < 1.0 / 3.0:
+                    use_txt, ex_boxes = False, sample['exemplar_boxes']
+                elif r < 2.0 / 3.0:
+                    use_txt, ex_boxes = True, sample['exemplar_boxes']
+                else:
+                    use_txt, ex_boxes = True, None
+            else:
+                use_txt, ex_boxes = True, None
+
+            if use_txt:
+                classes, task, target_idx = build_omdet_class_list(sample['prompt'], train_vocab, max_classes=a.max_classes)
+            else:
+                classes, task, target_idx = ['object'], 'Detect object.', 0
+
             inputs = model.processor(images=sample['pil_image'], text=classes, task=task, return_tensors='pt').to(device)
-            inject_ex = a.use_exemplars and len(sample['exemplar_boxes']) > 0 and (random.random() < a.exemplar_prob)
-            ex_boxes = sample['exemplar_boxes'] if inject_ex else None
             with torch.autocast('cuda', dtype=torch.float16, enabled=use_amp):
                 st = model.forward_stages(
                     inputs['pixel_values'],
@@ -395,6 +424,7 @@ def main():
                     inputs['classes_structure'],
                     target_idx=target_idx,
                     exemplar_boxes=ex_boxes,
+                    use_text=use_txt,
                 )
             loss, parts = compute_7layer_loss(criterion, st, sample, device, neg_class_weight=a.neg_class_weight)
             if not torch.isfinite(loss):
@@ -415,19 +445,21 @@ def main():
             del st, loss, inputs
             if (i + 1) % 200 == 0:
                 torch.cuda.empty_cache()
-                gate_val = float(torch.tanh(model.exemplar_cls_gate).item()) if a.use_exemplars else 0.0
+                v_sc = float(model.vis_logit_scale.exp().item()) if a.use_exemplars else 0.0
+                v_bs = float(model.vis_logit_bias.item()) if a.use_exemplars else 0.0
                 save(a.output / 'progress.json', dict(epoch=epoch, images=i + 1, total=len(names),
                                                       mean_loss=float(np.mean(losses)),
                                                       cls_loss=float(np.mean(cls_losses)),
                                                       center_loss=float(np.mean(ctr_losses)),
                                                       lr=optimizer.param_groups[0]['lr'],
-                                                      ex_gate=gate_val))
-                g_str = f' gate {gate_val:.3f}' if a.use_exemplars else ''
+                                                      vis_scale=v_sc, vis_bias=v_bs))
+                v_str = f' vscale {v_sc:.2f} vbias {v_bs:.2f}' if a.use_exemplars else ''
                 print(f"train {epoch} {i+1} {len(names)} loss {round(float(np.mean(losses)), 4)} "
                       f"cls {round(float(np.mean(cls_losses)), 4)} ctr {round(float(np.mean(ctr_losses)), 4)} "
-                      f"lr {optimizer.param_groups[0]['lr']:.2e}{g_str}", flush=True)
+                      f"lr {optimizer.param_groups[0]['lr']:.2e}{v_str}", flush=True)
 
-        res = evaluate_omdet(model, val, dev, device, a.output / f'dev_epoch{epoch:02d}.json', use_exemplars=a.use_exemplars)
+        res = evaluate_omdet(model, val, dev, device, a.output / f'dev_epoch{epoch:02d}.json',
+                             use_exemplars=a.use_exemplars, use_text=True)
         res_abs = evaluate_omdet(model, val, ['1919.jpg', '3436.jpg'], device, a.output / f'absent_epoch{epoch:02d}.json',
                                  absent=True, use_exemplars=False)
         mae = res['summary']['0.23']['mae']
@@ -437,17 +469,21 @@ def main():
                      center_loss=float(np.mean(ctr_losses)), dev_mae=mae, dev_best_th_mae=best_th_mae,
                      absent_mae=absent_mae)
         if a.use_exemplars:
-            res_txt = evaluate_omdet(model, val, dev, device, a.output / f'dev_text_epoch{epoch:02d}.json', use_exemplars=False)
+            res_ex = evaluate_omdet(model, val, dev, device, a.output / f'dev_exonly_epoch{epoch:02d}.json',
+                                    use_exemplars=True, use_text=False)
+            res_txt = evaluate_omdet(model, val, dev, device, a.output / f'dev_text_epoch{epoch:02d}.json',
+                                     use_exemplars=False, use_text=True)
+            entry['dev_ex_only_mae'] = res_ex['summary']['0.23']['mae']
             entry['dev_text_mae'] = res_txt['summary']['0.23']['mae']
-            entry['ex_gate'] = float(torch.tanh(model.exemplar_cls_gate).item())
         history.append(entry)
         save(a.output / 'history.json', history)
         torch.save(dict(trainable=model.export_trainable_state(), epoch=epoch, dev_mae=mae, manifest=manifest), a.output / 'last.pth')
         if mae < best:
             best = mae
             torch.save(dict(trainable=model.export_trainable_state(), epoch=epoch, dev_mae=best, manifest=manifest), a.output / 'best.pth')
-        extra_str = f" text_mae {round(entry['dev_text_mae'], 3)}" if 'dev_text_mae' in entry else ''
-        print(f"epoch {epoch} dev_mae {round(mae, 3)}{extra_str} best_th_mae {round(best_th_mae, 3)} "
+        extra = (f" ex_only_mae {round(entry['dev_ex_only_mae'], 3)} text_mae {round(entry['dev_text_mae'], 3)}"
+                 if 'dev_ex_only_mae' in entry else '')
+        print(f"epoch {epoch} dev_mae {round(mae, 3)}{extra} best_th_mae {round(best_th_mae, 3)} "
               f"absent {round(absent_mae, 1)} best {round(best, 3)}", flush=True)
 
     best_state = torch.load(a.output / 'best.pth', map_location='cpu', weights_only=False)
@@ -455,19 +491,22 @@ def main():
     final_summary = dict(state='complete', best_epoch=best_state['epoch'], best_dev_mae=best)
     final_summary['fullval_raw'] = evaluate_omdet(
         model, val, val.names, device, a.output / 'adapted_fullval_raw.json',
-        use_exemplars=a.use_exemplars, tile_trigger=0)['summary']
+        use_exemplars=a.use_exemplars, use_text=True, tile_trigger=0)['summary']
     if a.tile_trigger > 0:
         final_summary['fullval_tiled'] = evaluate_omdet(
             model, val, val.names, device, a.output / 'adapted_fullval_tiled.json',
-            use_exemplars=a.use_exemplars, tile_trigger=a.tile_trigger)['summary']
+            use_exemplars=a.use_exemplars, use_text=True, tile_trigger=a.tile_trigger)['summary']
     if a.use_exemplars:
+        final_summary['fullval_ex_only'] = evaluate_omdet(
+            model, val, val.names, device, a.output / 'adapted_fullval_ex_only.json',
+            use_exemplars=True, use_text=False, tile_trigger=a.tile_trigger)['summary']
         final_summary['fullval_text_only'] = evaluate_omdet(
             model, val, val.names, device, a.output / 'adapted_fullval_text_only.json',
-            use_exemplars=False, tile_trigger=a.tile_trigger)['summary']
+            use_exemplars=False, use_text=True, tile_trigger=a.tile_trigger)['summary']
     if pilot:
         final_summary['pilot58'] = evaluate_omdet(
             model, val, pilot, device, a.output / 'adapted_pilot58.json',
-            use_exemplars=a.use_exemplars, tile_trigger=a.tile_trigger)['summary']
+            use_exemplars=a.use_exemplars, use_text=True, tile_trigger=a.tile_trigger)['summary']
     final_summary['absent'] = evaluate_omdet(
         model, val, ['1919.jpg', '3436.jpg'], device, a.output / 'adapted_absent.json',
         absent=True, use_exemplars=False, tile_trigger=0)['summary']

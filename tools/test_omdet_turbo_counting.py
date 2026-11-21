@@ -67,16 +67,16 @@ class OmDetTurboCountingTests(unittest.TestCase):
         self.assertEqual(len(sample['exemplar_indices']), 1)
         self.assertTrue((sample['supervision_points'] >= 0).all() and (sample['supervision_points'] <= 1).all())
 
-    def test_end_to_end_forward_backward_cache_safety_and_frozen_bn(self):
-        """Verify ALL 7 stages, Dual-Path exemplar grads, FrozenBN, and repeated forward LRU cache safety."""
+    def test_all_three_modes_forward_backward_frozen_clip_heads_and_cache_safety(self):
+        """Verify Exemplar-Only, Text+Exemplar, and Text-Only forward/backward, FrozenBN, and frozen CLIP heads."""
         tiny = _make_tiny_omdet()
-        model = OmDetTurboCounting('tiny-omdet', device='cpu', freeze_backbones=True, use_exemplars=True,
-                                   detector=tiny, processor=object())
+        model = OmDetTurboCounting(
+            'tiny-omdet', device='cpu', freeze_backbones=True, freeze_class_heads=True,
+            use_exemplars=True, detector=tiny, processor=object(),
+        )
         model.set_training(True)
-        # All BatchNorm2d layers must remain in eval mode even when model.set_training(True)
         bns = [m for m in model.detector.modules() if isinstance(m, nn.BatchNorm2d)]
-        self.assertTrue(len(bns) > 0)
-        self.assertTrue(all(not bn.training for bn in bns))
+        self.assertTrue(len(bns) > 0 and all(not bn.training for bn in bns))
 
         pixel_values = torch.randn(1, 3, 64, 64)
         classes_ids = torch.tensor([[10, 20, 30, 0], [10, 40, 50, 0], [10, 60, 70, 0]])
@@ -91,36 +91,56 @@ class OmDetTurboCountingTests(unittest.TestCase):
             exemplar_boxes=ex_boxes,
         )
 
-        # Run TWO consecutive forward+backward passes with identical prompts to prove LRU cache holds no stale graph!
-        for step in range(2):
-            model.zero_grad(set_to_none=True)
-            st = model.forward_stages(
-                pixel_values, classes_ids, classes_mask, tasks_ids, tasks_mask, classes_struct,
-                target_idx=1, exemplar_boxes=ex_boxes,
-            )
-            self.assertEqual(st['boxes'].shape, (12, 4))
-            self.assertEqual(st['logits'].shape, (12, 3))
-            self.assertEqual(len(st['aux_boxes']), 1)  # 2 decoder layers -> 1 aux + 1 final
-            self.assertEqual(st['target_tokens'].tolist(), [False, True, False])
-            loss, _ = compute_7layer_loss(CountingCriterion(), st, sample, 'cpu')
-            loss.backward()
+        # 1) Text-Only mode (K=3 columns, 1 True)
+        model.zero_grad(set_to_none=True)
+        st_txt = model.forward_stages(
+            pixel_values, classes_ids, classes_mask, tasks_ids, tasks_mask, classes_struct,
+            target_idx=1, exemplar_boxes=None, use_text=True,
+        )
+        self.assertEqual(st_txt['logits'].shape, (12, 3))
+        self.assertEqual(st_txt['target_tokens'].tolist(), [False, True, False])
+        loss_txt, _ = compute_7layer_loss(CountingCriterion(), st_txt, sample, 'cpu')
+        loss_txt.backward()
 
-        # Verify ALL trainable blocks received real non-zero gradients
+        # 2) Exemplar-Only mode (E=2 visual columns, both True)
+        model.zero_grad(set_to_none=True)
+        st_ex = model.forward_stages(
+            pixel_values, classes_ids[:1], classes_mask[:1], tasks_ids, tasks_mask, torch.tensor([1]),
+            target_idx=0, exemplar_boxes=ex_boxes, use_text=False,
+        )
+        self.assertEqual(st_ex['logits'].shape, (12, 2))
+        self.assertEqual(st_ex['target_tokens'].tolist(), [True, True])
+        loss_ex, _ = compute_7layer_loss(CountingCriterion(), st_ex, sample, 'cpu')
+        loss_ex.backward()
+
+        # 3) Multimodal Text+Exemplar mode (K+E=5 columns: target_idx=1 + 2 visual exemplars True)
+        model.zero_grad(set_to_none=True)
+        st_mm = model.forward_stages(
+            pixel_values, classes_ids, classes_mask, tasks_ids, tasks_mask, classes_struct,
+            target_idx=1, exemplar_boxes=ex_boxes, use_text=True,
+        )
+        self.assertEqual(st_mm['logits'].shape, (12, 5))
+        self.assertEqual(st_mm['target_tokens'].tolist(), [False, True, False, True, True])
+        loss_mm, _ = compute_7layer_loss(CountingCriterion(), st_mm, sample, 'cpu')
+        loss_mm.backward()
+
+        # Verify ALL trainable blocks receive real non-zero gradients
         self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.detector.encoder.parameters()))
         self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.detector.decoder.encoder_bbox_head.parameters()))
-        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.detector.decoder.encoder_class_head.parameters()))
         self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.detector.decoder.decoder_bbox_head.parameters()))
-        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.detector.decoder.decoder_class_head.parameters()))
         self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.detector.decoder.task_encoder.parameters()))
-        # Dual-path exemplar modules
         self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.exemplar_proj.parameters()))
-        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.exemplar_to_embed.parameters()))
-        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.exemplar_proto_head.parameters()))
-        self.assertTrue(model.exemplar_task_embed.grad is not None and model.exemplar_task_embed.grad.abs().sum() > 0)
-        self.assertTrue(model.exemplar_cls_gate.grad is not None and model.exemplar_cls_gate.grad.abs().sum() > 0)
-        # Backbones strictly frozen
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.sim_fusion_convs.parameters()))
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.exemplar_to_task.parameters()))
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.vis_query_head.parameters()))
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.vis_ex_head.parameters()))
+        self.assertTrue(model.vis_logit_scale.grad is not None and model.vis_logit_scale.grad.abs().sum() > 0)
+        self.assertTrue(model.vis_logit_bias.grad is not None and model.vis_logit_bias.grad.abs().sum() > 0)
+        # Backbones AND all 7 CLIP class projection heads must stay strictly frozen!
         self.assertTrue(all(p.grad is None for p in model.detector.vision_backbone.parameters()))
         self.assertTrue(all(p.grad is None for p in model.detector.language_backbone.parameters()))
+        self.assertTrue(all(p.grad is None for p in model.detector.decoder.encoder_class_head.parameters()))
+        self.assertTrue(all(p.grad is None for p in model.detector.decoder.decoder_class_head.parameters()))
 
 
 if __name__ == '__main__':

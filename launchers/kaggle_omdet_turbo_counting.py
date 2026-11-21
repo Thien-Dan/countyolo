@@ -1,4 +1,4 @@
-"""Package and submit OmDet-Turbo counting experiments (eval / text / multimodal) to Kaggle."""
+"""Package and submit OmDet-Turbo v2 counting experiments (eval / text / multimodal) to Kaggle."""
 import argparse
 import base64
 from datetime import datetime, timezone
@@ -57,7 +57,7 @@ try:
         '--max-classes',str(SPEC['max_classes']),'--neg-class-weight',str(SPEC['neg_class_weight']),
         '--tile-trigger',str(SPEC['tile_trigger']),*init_args]
     if SPEC.get('use_exemplars'):
-        common.extend(['--use-exemplars','--exemplar-prob',str(SPEC.get('exemplar_prob',0.5))])
+        common.append('--use-exemplars')
     if SPEC['mode']=='eval':
         status('evaluating')
         run([sys.executable,'-u','tools/train_omdet_turbo_counting.py',*common,
@@ -80,25 +80,25 @@ except BaseException as exc:
 MODE_META = {
     'eval': (
         'countyolo-omdet-turbo-eval-20261121',
-        'OmDet-Turbo Full-Val (raw + 2x2 tiled), Pilot-58, and Absent evaluation',
+        'OmDet-Turbo v2 Full-Val (raw + 2x2 tiled), Pilot-58, and Absent evaluation',
         False,
     ),
     'text': (
-        'countyolo-omdet-turbo-text-20261121',
-        'OmDet-Turbo Real-Time Text-Only Counting (RT-DETR HybridEncoder + 7-layer CountGD-Box + balanced 8-class negatives)',
+        'countyolo-omdet-turbo-text-v2-20261121',
+        'OmDet-Turbo v2 Text-Only (Frozen CLIP class heads + RT-DETR HybridEncoder + balanced 8-class negatives)',
         False,
     ),
     'multimodal': (
-        'countyolo-omdet-turbo-mm-20261121',
-        'OmDet-Turbo Real-Time Multimodal Counting (Dual-Path ROIAlign Exemplars into Task Self-Attn & Gated Class Prototype + 7-layer loss)',
+        'countyolo-omdet-turbo-mm-v2-20261121',
+        'OmDet-Turbo v2 Class-Agnostic Multimodal (Frozen CLIP heads + Spatial Sim-Map + Direct Visual Cosine Head + 33/33/33 Modality Dropout)',
         True,
     ),
 }
 
 
 def prepare(user='nadthien', mode='multimodal', model_id='omlab/omdet-turbo-swin-tiny-hf',
-            epochs=20, lr=3e-5, exemplar_lr=1.5e-4, max_classes=8, neg_class_weight=1.0,
-            exemplar_prob=0.5, tile_trigger=600, init_kernel=None, init_dataset=None):
+            epochs=20, lr=3e-5, exemplar_lr=1.5e-4, max_classes=8, neg_class_weight=0.5,
+            tile_trigger=600, init_kernel=None, init_dataset=None):
     slug, purpose, use_exemplars = MODE_META[mode]
     folder = ROOT / 'kaggle_video_run' / user / slug
     folder.mkdir(parents=True, exist_ok=True)
@@ -113,7 +113,7 @@ def prepare(user='nadthien', mode='multimodal', model_id='omlab/omdet-turbo-swin
         max_classes=max_classes,
         neg_class_weight=neg_class_weight,
         use_exemplars=use_exemplars,
-        exemplar_prob=exemplar_prob,
+        freeze_class_heads=True,
         tile_trigger=tile_trigger,
         init_kernel=init_kernel,
         init_dataset=init_dataset,
@@ -168,8 +168,7 @@ def main():
     p.add_argument('--lr', type=float, default=3e-5)
     p.add_argument('--exemplar-lr', type=float, default=1.5e-4)
     p.add_argument('--max-classes', type=int, default=8)
-    p.add_argument('--neg-class-weight', type=float, default=1.0)
-    p.add_argument('--exemplar-prob', type=float, default=0.5)
+    p.add_argument('--neg-class-weight', type=float, default=0.5)
     p.add_argument('--tile-trigger', type=int, default=600)
     p.add_argument('--init-kernel', default=None)
     p.add_argument('--init-dataset', default=None)
@@ -179,10 +178,9 @@ def main():
         user=a.user, mode=a.mode, model_id=a.model_id,
         epochs=a.epochs, lr=a.lr, exemplar_lr=a.exemplar_lr,
         max_classes=a.max_classes, neg_class_weight=a.neg_class_weight,
-        exemplar_prob=a.exemplar_prob, tile_trigger=a.tile_trigger,
-        init_kernel=a.init_kernel, init_dataset=a.init_dataset,
+        tile_trigger=a.tile_trigger, init_kernel=a.init_kernel, init_dataset=a.init_dataset,
     )
-    ledger = ROOT / f'experiments/omdet_turbo_{a.mode}_kaggle_20261121_{a.user}.json'
+    ledger = ROOT / f'experiments/omdet_turbo_{a.mode}_v2_kaggle_20261121_{a.user}.json'
     ledger.write_text(json.dumps(job, indent=2), encoding='utf-8')
     if a.push:
         ver, remote_state = push_with_retry(a.user, job)
