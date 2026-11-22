@@ -491,10 +491,11 @@ class DeformableTransformerEncoder(nn.Module):
         return torch.cat(refs, 1)[:, :, None] * valid_ratios[:, None]
 
     def forward(self, src: Tensor, pos: Tensor, spatial_shapes: Tensor,
-                valid_ratios: Tensor, key_padding_mask: Tensor, grad_checkpoint: bool = False) -> Tensor:
+                valid_ratios: Tensor, key_padding_mask: Tensor, grad_checkpoint: bool = False,
+                post_layer_hooks: Optional[dict] = None) -> Tensor:
         out = src
         ref_pts = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             if grad_checkpoint and self.training and torch.is_grad_enabled():
                 out = torch.utils.checkpoint.checkpoint(
                     lambda s, _l=layer: _l(s, pos, ref_pts, spatial_shapes, key_padding_mask),
@@ -503,6 +504,8 @@ class DeformableTransformerEncoder(nn.Module):
                 )
             else:
                 out = layer(out, pos, ref_pts, spatial_shapes, key_padding_mask)
+            if post_layer_hooks is not None and layer_idx in post_layer_hooks:
+                out = post_layer_hooks[layer_idx](out, spatial_shapes, valid_ratios)
         return out
 
 
@@ -639,7 +642,8 @@ class OVDeformableTransformer(nn.Module):
         valid_w = torch.sum(~mask[:, 0, :], 1).float() / float(w)
         return torch.stack([valid_w, valid_h], -1)
 
-    def encode_memory(self, srcs: list[Tensor], masks: list[Tensor], pos_embeds: list[Tensor], grad_checkpoint: bool = False):
+    def encode_memory(self, srcs: list[Tensor], masks: list[Tensor], pos_embeds: list[Tensor],
+                      grad_checkpoint: bool = False, post_layer_hooks: Optional[dict] = None):
         src_flatten, mask_flatten, lvl_pos_flatten, spatial_shapes = [], [], [], []
         for lvl, (src, mask, pos) in enumerate(zip(srcs, masks, pos_embeds)):
             bs, c, h, w = src.shape
@@ -653,7 +657,10 @@ class OVDeformableTransformer(nn.Module):
         spatial_shapes_t = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
 
-        memory = self.encoder(src_flatten, lvl_pos_flatten, spatial_shapes_t, valid_ratios, mask_flatten, grad_checkpoint=grad_checkpoint)
+        memory = self.encoder(
+            src_flatten, lvl_pos_flatten, spatial_shapes_t, valid_ratios, mask_flatten,
+            grad_checkpoint=grad_checkpoint, post_layer_hooks=post_layer_hooks,
+        )
         return dict(
             memory=memory,
             mask_flatten=mask_flatten,
@@ -670,6 +677,9 @@ class OVDeformableTransformer(nn.Module):
         enc_coord_unact = self.enc_out_bbox_embed(output_memory) + output_proposals  # (B, S, 4)
         select_score = enc_class.max(-1)[0]
         if enc_prompt_bias is not None:
+            # v3 Fix #4: Prompt spatial prior guides top-K proposal selection ONLY;
+            # never added into `enc_class_topk` so Stage-1 objectness stays class-agnostic
+            # (zero CLIP double-counting and zero positive-class leakage into negative columns).
             select_score = select_score + enc_prompt_bias.to(select_score.dtype)
         # Mask invalid padded / out-of-range proposals so topk never selects padding
         invalid = mask_flatten | (~torch.isfinite(output_proposals[..., 0]))
@@ -681,9 +691,6 @@ class OVDeformableTransformer(nn.Module):
         refpoint_undetach = torch.gather(enc_coord_unact, 1, topk_inds.unsqueeze(-1).expand(-1, -1, 4))
         tgt_undetach = torch.gather(output_memory, 1, topk_inds.unsqueeze(-1).expand(-1, -1, self.d_model))
         enc_class_topk = torch.gather(enc_class, 1, topk_inds.unsqueeze(-1))
-        if enc_prompt_bias is not None:
-            enc_bias_topk = torch.gather(enc_prompt_bias, 1, topk_inds).unsqueeze(-1)
-            enc_class_topk = enc_class_topk + enc_bias_topk.to(enc_class_topk.dtype)
         return dict(
             refpoint_undetach=refpoint_undetach,
             tgt_undetach=tgt_undetach,

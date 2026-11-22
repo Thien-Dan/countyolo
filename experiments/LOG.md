@@ -509,3 +509,754 @@ cổng text nhân từng ô (vitgate, kể cả chưng cất SAM 3) · cổng m�
   benchmark and app defaults, identify batch8 explicitly in new evaluations.
 - Queue experiments/sam3_memory_tasks.json:2/2 complete, no pending tasks.
   Watcher85620 exited normally after downloading and verifying both outputs.
+# 2026-11-11 — UI CountYOLO chạy đủ ba stage với SAM2
+
+- Thay tracker nhẹ trong tab video bằng proposal CountYOLO → mask độc lập SAM2
+  → lọc ngắn hạn w=3 (chuỗi khớp mask IoU >0.5) → tracking dài hạn và kiểm tra
+  mask mới không chồng lấn với vật đã theo dõi. SAM 2.1 large, object batch 8,
+  offload video/state sang CPU; SAM2 cài thêm vào `.venv` hiện có, không đổi torch.
+- Adapter giữ ý tưởng/tiêu chí ba stage của CountVid, có thêm lọc mask rỗng,
+  mask độc lập trùng IoU ≥0.85, xử lý frame đầu rỗng và cấp ID qua nhiều batch.
+  Đây không phải cấu hình benchmark cũ; không gán lại các MAE cũ cho UI mới.
+- Clip người dùng `vid_000001.mp4`: 30 FPS, 151 frame; lấy 3 FPS, chỉ 10 frame
+  đầu, prompt `cube`, head exnoise, min_mass=0.2. Mắt thường thấy 5 cube.
+  Tracker appearance cũ:25; position:30. Pipeline SAM2 mới:10, 140.44 giây
+  (Stage1 20.17s, Stage2 96.24s, Stage3 11.60s; tổng gồm nạp SAM2).
+- Proposal/frame:19,19,21,21,17,20,20,16,17,22. Sau temporal filter:
+  13,13,12,12,16,16,14,11,11,8. Preview mask cho thấy các mặt của cùng cube
+  vẫn bị phân đoạn thành các ID riêng; SAM2 không tự gộp các mask rời nhau.
+  Không chỉnh ngưỡng để ép kết quả về 5 trên clip này.
+- Artifacts local: `outputs/cube_video_diagnostic/sam2/` (JSON, GIF và ảnh mask).
+  5 kiểm tra logic mới + 18 kiểm tra pipeline cũ đạt; Gradio build thành công.
+# 2026-11-13 — Đối chiếu UI và terminal trên cùng đầu vào
+
+- UI trước đây mặc định tối đa 120 frame, CLI dùng toàn bộ; UI/CLI còn có hai
+  cách sắp xếp tên ảnh. Penguins có 34/94/94 frame nên mức mặc định 120 không
+  cắt chúng, nhưng UI còn giữ giới hạn 10 từ thử cube sẽ khác CLI không giới hạn.
+  Không lưu được cấu hình UI của lần người dùng báo thiếu nhiều, nên chưa quy
+  nguyên nhân cụ thể cho lần chạy đó.
+- Kiểm tra riêng CLIP trước/sau chuyển precision không đổi density/box trên
+  frame Penguins đầu tiên; không có bằng chứng CLIP là nguyên nhân.
+- Thống nhất đọc frame và suy ra prompt qua `video/frame_input.py`; UI dùng
+  0=toàn bộ như CLI, không fallback âm thầm sang video khác khi path frame sai.
+  Thêm JSON UI, hash nội dung frame/checkpoint/SAM2 và hash mã pipeline; cache
+  model UI nạp lại nếu checkpoint trên đĩa được thay thế.
+- Chạy thật 3 frame đầu penguins_1, exnoise, penguin, min_mass=.2, w=3, batch=8:
+  UI có startup warmup và CLI đều ra16; proposal_counts, independent_counts,
+  filtered_counts, frame_counts và fingerprint giống hệt nhau. Đây là kiểm tra
+  parity ngắn, không phải benchmark lại toàn bộ clip.
+- Artifacts: `outputs/ui_terminal_parity/{ui,terminal,comparison}.json`.
+
+
+## 2026-11-17 ? Exemplar reliability development experiment
+
+- Added opt-in reliability selection: positive CLIP target-vocabulary margin,
+  local density mass and detector or confirmed temporal support. Scores are
+  relative evidence, not calibrated probabilities; YOLO-World and CLIP are
+  correlated sources. Fixed rules are declared before GPU evaluation.
+- Select distinct feature cells without repeating weak candidates to fill K.
+  Rejected candidates have zero weight in P3/P4/DINOv2 matching. If all are
+  rejected, use the separately supervised coarse density instead of forcing
+  a prototype or returning zero. This fallback may still produce false positives.
+- A short-lived CLIP feature anchor requires two consecutive detector-supported
+  frames. Temporal-only support cannot refresh its own TTL. No cross-frame
+  P3/P4/DINOv2 prototype reuse and no change to SAM2 tracking/thresholds.
+- Default UI/self-exemplar path is retained; CLI enables the experiment with
+  --exemplar-policy reliable. Added per-frame exemplar/proposal/mask/new-ID
+  traces and cumulative count, plus paired evaluation CSVs and mask snapshots.
+- Local: 10 reliability tests, 5 SAM2 logic tests, 5 frontend tests and 18 video
+  pipeline tests passed. GPU smoke verified identical control decoder and
+  exact coarse fallback. One repeated frame probe is not accuracy evidence.
+- Prepared private ttdan2006/countyolo-exemplar-reliability-20261117: full
+  Penguins-1 (34 frames) and Crystals ma2035_039 (41), control versus reliable,
+  same exnoise checkpoint, pixel fingerprints, decoder and SAM2 backend.
+  This is a development diagnostic, not O2 evaluation or a heldout benchmark.
+
+- GPU integration smoke on first 3 Penguins frames completed: reliable count11,
+  proposals20/20/19, selected5/5/5, final cumulative trace11. No prefix GT was
+  assigned; this is integration evidence only, not an accuracy score.
+- Kaggle accepted version1, kernel145604859, private ttdan2006 account. Initial
+  remote state QUEUED. Bounded watcher polls60s and fetches only small artifacts;
+  paired results require matching frame/checkpoint/SAM2 hashes and settings.
+
+- User approved routing exemplar diagnostic to nadthien. Private version1 accepted (kernel145607767); source payload byte-identical to ttdan2006 job, using existing nadthien/videocount-benchmark. Active local watcher moved to nadthien; original ttdan2006 queued job has not been cancelled and is retained in experiments/exemplar_reliability_ttdan2006_20261117.json.
+
+- User requested cancellation of ttdan2006 duplicate exemplar. Verified private kernel145604859 was QUEUED, preserved metadata/source locally, then deleted that duplicate via official API. CountVid baseline on ttdan2006 was still RUNNING afterward; nadthien exemplar remains the active evaluation.
+
+- Follow-up: nadthien version1 failed before inference while building pinned CLIP under isolated packaging on Kaggle Python3.13. Verified upstream setup imports pkg_resources; pinned setuptools80.9.0/wheel0.45.1 and disabled CLIP build isolation. Version2 accepted, initial QUEUED. Algorithm payload identical, no new tuning. Failed attempt and logs preserved in outputs/exemplar_reliability_kaggle_attempt1; bounded watcher restarted for v2.
+
+### 2026-11-17: opt-in openworld-v2, user-approved logic improvements
+
+- Added independent density peak proposals (no integral-count cap), detector
+  geometry fusion, coarse proposal retention and a reported 256-region budget.
+  Density-only boxes remain square estimates; this does not solve full bbox
+  localization or small-object resolution. No new detector training occurred.
+- Detector-free exemplar initialization, explicit equivalent-name aliases,
+  absolute margin coarse/refine blending, final-region CLIP inspection and
+  one-to-one spatial/appearance confirmation. Pending regions do not enter SAM2.
+  Region IDs are temporary associations, not global identities.
+- New CLI mode `--exemplar-policy openworld`; evaluator supports
+  `--modes control reliable openworld`. Existing default and running Kaggle
+  payload are unchanged; no v2 accuracy claim or new remote submission.
+- Nine new behavioral regressions and twenty existing exemplar/SAM2/frontend
+  checks passed. Four-frame real Penguins-1 CUDA integration passed in 22.6s:
+  raw proposals 25/22/23/23, confirmed 0/7/8/9, SAM2 filtered 0/1/3/2,
+  final unique count 3. First-frame density 16.91 produced 25 raw proposals.
+  No prefix GT assigned: this is execution evidence, not accuracy validation.
+  The combined confirmation plus SAM2 persistence is potentially too strict;
+  thresholds were not tuned on this smoke clip. Local SAM2 extension `_C`
+  unavailable, so optional hole-filling postprocessing was skipped.
+- Artifact: outputs/exemplar_reliability_local/openworld_v2_smoke.json.
+  Remaining limits: CLIP parent/child ambiguity, relative uncalibrated evidence,
+  short/fast appearances, coarse square geometry and no global ReID.
+
+### 2026-11-17: FSC147 validation selects a simpler proposal improvement
+
+- Executed a fixed-seed 58-image pilot (2/class), then all 1,286 validation
+  images, 29 classes, exnoise checkpoint, self-exemplars, no GT exemplar input.
+  Test split untouched. Count errors and one-to-one point localization at
+  radii 8/16 pixels in resized 640-space are separate; not bbox AP.
+- Full v2 failed to improve: density MAE 28.1015 vs original 23.3608;
+  static CLIP hard-gated proposal recall@16 only 21.7962%. 494 images selected
+  no exemplar. Do not promote v2 or hard CLIP gating based on these results.
+- Isolated uncapped density decoder: initial 256-candidate compute budget
+  truncated 24 images. Removed that CLIP-specific budget from density-only
+  `recall`, then reran all validation. Paired image hashes and density values
+  matched exactly across both full runs.
+- Original capped proposals -> all valid density peaks (min mass .2):
+  proposal-count MAE 25.0389 -> 23.3188; RMSE 89.7105 -> 86.1309;
+  point precision@16 81.2515% -> 78.2002%; recall 56.3419% -> 62.8617%;
+  F1 66.5419% -> 69.6970%. F1@8 also improved 52.3969% -> 54.5881%.
+  Original density integral is unchanged (MAE 23.3608), so do not describe this
+  as improved density prediction. No thresholds fitted in these runs.
+- Keep `--exemplar-policy recall` opt-in for the next video ablation; default
+  stays self. More proposals can increase SAM2 cost/false tracks. Geometry
+  fusion did not outperform unfused peaks on these point metrics; actual
+  box geometry remains unvalidated without box annotations.
+- Added independent static-image evaluation (no temporal confirmation/memory),
+  source/checkpoint/image fingerprints, per-image diagnostics and source copies.
+  31 regression tests passed including >256 density peaks and unchanged counts.
+- Summary: experiments/fsc147_openworld_validation_20261117.json.
+  Full artifacts: outputs/fsc147_openworld/full_val and full_val_uncapped_all.
+
+### 2026-11-17: v3 remediation implemented and evaluated
+
+- Fixed connected flat maxima (one representative per plateau, valleys remain
+  separate). Added one-to-one geometry fusion without global NMS on density
+  boxes; a detector containing multiple density centers cannot erase them.
+  Density anchors survive geometry replacement and are logged separately.
+- Added peak-centered adaptive exact ROIAlign crops (nearest-center spacing,
+  side 8..96, 64-crop semantic budget independent of proposal recall), no final
+  CLIP veto, self fallback, and isolated rank/weight/blend/coarse-fallback variants.
+  Tested optional ROI-average prototypes separately. No checkpoint retraining.
+- Added coarse/unblended/final counts, crop coordinates, feature centers,
+  proposal sources, detector rejection reasons and exact float32 crop exports.
+- 40 regression checks passed. Full 1,286-image validation baseline hashes and
+  density predictions exactly matched previous results. Plateau removed zero
+  cells in this real set (an edge-case fix, not a measured gain). Geometry
+  rejected 543 multi-center detector boxes. V3 fallback occurred on 574 images.
+- Full validation: recall/plateau proposal MAE 23.3188, F1@16 .69697;
+  rank 23.8048/.69368, weighted 24.7271/.68659, blend 24.1407/.69270,
+  coarse fallback 24.6034/.68530. Geometry anchors F1 .69701, box centers .69604.
+  Region-pooling pilot MAE 20.7586/F1 .62846 vs point-rank 19.3793/.65720;
+  not promoted. Exemplar changes did not outperform existing recall overall.
+- Froze plateau+original self-exemplar before one full 1,190-image FSC147 test.
+  Policy hashes verified unchanged after test. Original capped -> selected:
+  MAE 17.67395 -> 17.59244, RMSE 114.26135 -> 114.90968;
+  P@16 .79656 -> .76451, R .69007 -> .74323, F1 .73950 -> .75372.
+  Recall/F1 improved, precision and RMSE worsened; no uniform superiority claim.
+- Important unresolved semantic failure: on two visually inspected validation
+  images with no elephants, recall/rank/region still produced 437 and 264
+  proposals. In the synthetic mixed image, the polka-dots query put 311/312
+  proposals on the bottle-cap half. These tiny sanity checks are not general
+  benchmarks, but prevent claiming open-world correctness from FSC147 alone.
+  No thresholds fitted on these checks or on test; no model promotion/default
+  change. Semantic training needs verified negatives and mixed-class supervision;
+  random alternate FSC147 prompts alone do not establish absence.
+- Six-frame Penguins-1 paired SAM2 integration completed for recall, plateau,
+  geometry: all returned 19 IDs. Prefix GT intentionally null and accuracy
+  metrics disabled. Local SAM2 optional hole-fill extension unavailable.
+  This validates integration, not full-video accuracy or global ReID.
+- Final summary: experiments/proposal_v3_results_20261117.json.
+  Frozen config: experiments/proposal_v3_frozen_20261117.json.
+  Artifact folders: outputs/fsc147_openworld/v3_*.
+
+### 2026-11-17: original CountVid detection-only comparison
+
+- Ran original CountGD stage from pinned CountVid commit
+  690ca3e48369c35f5e23a3ab5d2b04b56881a343, original countgd_box checkpoint,
+  text-only, short-side800/max1333, max token sigmoid >.23, no NMS/tiling/SAM2.
+  Local CUDA float32, upstream PyTorch deformable-attention fallback (no custom
+  extension). BERT initialized from matching config then fully overwritten by
+  original checkpoint; local BERT tokenizer used. All model keys loaded; only
+  unused feature_map_encoder checkpoint keys ignored as by upstream strict=False.
+- Pilot only: same 58 validation images, 29 classes, verified identical pixels
+  and GT against saved CountYOLO v3 pilot. Compare native preprocessing, not
+  matched-resolution architecture ablation. Point metrics in common 640-space.
+- CountGD vs CountYOLO plateau: MAE 12.6379 vs 20.3966; RMSE 48.4471 vs 60.1408;
+  P@16 .79705 vs .72105, R .69518 vs .57365, F1 .74264 vs .63896.
+- Two visually reviewed absent-elephant images: CountGD 0/0 versus CountYOLO
+  437/264. Mixed bottle caps: CountGD399 (GT436), zero wrong-half boxes;
+  mixed polka dots: CountGD410 (GT443), but393 boxes on wrong half. CountYOLO
+  produced312 with311 on wrong half. Both fail that fine-grained mixed prompt;
+  close aggregate count alone is not evidence of correct object recognition.
+- Runner: tools/eval_countvid_detect.py. Raw boxes/scores and environment audit:
+  outputs/countvid_detect/pilot58. Comparison:
+  experiments/countvid_detect_comparison_20261117.json.
+  No full-validation/test or full CountVid tracking accuracy claimed here.
+
+### 2026-11-17: controlled semantic training pilot (rejected)
+
+Video v3 submission follow-up: private Penguins full-video paired control/plateau
+job submitted to nadthien/countyolo-video-v3-penguins-20261117. Original exnoise
+checkpoint; no rejected semantic weights. 24 proposal/SAM2/runner tests passed.
+Crystals submission hit Kaggle maximum2 batch GPU sessions; MOT20 not submitted.
+Switch to thiend27 was rejected by automatic approval review pending explicit
+account authorization. Those two job packages remain prepared locally.
+User subsequently explicitly authorized thiend27. Both jobs were submitted
+successfully: thiend27/countyolo-video-v3-crystals-20261117 (7 videos) and
+thiend27/countyolo-video-v3-mot20-20261117 (3 videos), initially QUEUED.
+Each runs full sampled sequences for control and plateau with original exnoise
+and SAM2. Submission records: experiments/video_v3_{crystals,mot20}_20261117.json.
+
+2026-11-18 check: Penguins v3 session log confirms all6 video/mode cases complete.
+GT28/59/38; control21/46/35, plateau21/47/36. Control MAE7.6667 RMSE8.6987;
+plateau MAE7.0000 RMSE8.1035. CountVid baseline26/51/38, MAE3.3333 RMSE4.7610.
+Counts extracted from structured JSON log lines; remote JSON output download
+intermittently times out. Saved extracted rows in
+experiments/video_v3_penguins_log_results_20261118.json.
+Both Crystals and MOT20 v3 ended ERROR before inference: data discovery raises
+Expected exactly one pre-sampled VideoCount cache. No model metrics for them.
+No job resubmitted in this status-check turn.
+
+### 2026-11-18: DINOv3 real-weight static pilot
+
+Follow-up requested by user: deleted experiment/dinov3-exemplar-detect branch,
+standalone DINOv3 detector/head/train/test scripts and unsubmitted Kaggle package
+and weight staging cache. Returned to master with unrelated workspace changes
+preserved. Historical experiment results retained. No DINOv3 Kaggle job submitted.
+
+Replaced frozen feature extractor inside main CountYOLO in an opt-in paired test,
+same exnoise trained heads and self-exemplars,58 fixed validation images, no GT
+exemplars, no training or threshold tuning. Channel dimensions remain384.
+DINOv2@560: proposal MAE20.3966 RMSE60.1408, density MAE20.8906,
+P@16 .72105 R .57365 F1 .63896.
+DINOv3@560 (same input pixels,35x35 patches): proposal MAE26.2069 RMSE56.0668,
+density MAE22.8574, P .59498 R .65786 F1 .62484.
+DINOv3@640 (same40x40 patch grid): proposal MAE25.8103 RMSE55.9700,
+density MAE22.8635, P .59939 R .65026 F1 .62379.
+All trainable head weights checked unchanged by hash during evaluation.19 existing
+matcher/proposal tests pass. Recall improves but precision/MAE worsen; no promotion.
+Exported both DINOv3 swap candidates with vit_revision and explicit transfer-only
+metadata under outputs/backbone_swap_dinov3/pilot58. This is a distribution-transfer
+diagnostic with DINOv2-trained heads, not a retrained backbone ranking.
+Summary: experiments/dinov3_backbone_swap_20261118.json.
+
+### 2026-11-18: main-pipeline backbone adaptation started
+
+- tools/adapt_backbone.py retains original CountYOLO architecture and exnoise
+  initialization. Two matched arms: frozen DINOv2-S@560 continued-training
+  control, frozen DINOv3-S@640 with adapted heads. Existing trainable heads,
+  projections, matchers and scale head updated; neither backbone nor YOLO trained.
+- Full3659 train /1286 validation,3 epochs per arm, batch4, lr1e-5, float32,
+  self-exemplars only, no GT exemplar input, no random negative labels, no test.
+  Original multi-scale count, density/coarse and scale losses retained. Seed
+  reset after backbone construction to match augmentation/dropout RNG sequence.
+- Select by validation point F1@16 with original DINOv2 density-MAE retention
+  guard1.10; initial candidate retained. No automatic default promotion.
+- Smoke test completed both arms through training, validation, checkpoint saving;
+  verified actual head parameter/buffer change and DINOv3 checkpoint metadata.
+  Existing19 matcher/proposal regression tests passed.
+- Kaggle private package prepared: nadthien/countyolo-backbone-adaptation-20261118.
+  Upload stalled with API connection/DNS errors; canceled retry process before
+  submission. Ledger experiments/backbone_adaptation_kaggle_20261118.json records
+  blocked_network_not_submitted. No claim of remote training.
+- Full offline-cache local GPU run started instead, PID32512, output
+  outputs/backbone_adaptation/full_train_val. Initial DINOv2 full-val proposal
+  MAE23.3087, density MAE23.3462, F1 .696853; training epoch1 started915 steps.
+  Run writes live_progress.json, epoch metrics, best/last head checkpoints and
+  comparison.json. This log records launch status, not completed training results.
+
+Retry requested by user: private cache upload completed successfully after adding
+bounded connection timeouts/reconnect retries. Submitted
+nadthien/countyolo-backbone-adaptation-20261118; Kaggle initially QUEUED. Same
+paired3-epoch main-pipeline head-adaptation experiment, no new standalone detector.
+Weights in private nadthien/countyolo-dinov3-adapt-cache, verified by SHA256 in
+runner; no HF token included. Ledger updated from network-blocked to submitted.
+
+First Kaggle adaptation attempt failed before training: pathlib.rglob found no
+cache manifest although dataset status ready and all8 expected files existed.
+Changed input discovery to recursive glob following symlink mounts, deduplicated
+resolved paths; applies to both cache and FSC147 split discovery. Resubmitted
+without reuploading weights. Updated code SHA256
+2b7a7884ab8209d5b68755c696e274ca74862a7461e0831321b1fc128e0128e2;
+Kaggle returned RUNNING. Runtime estimate1-2h is provisional, not measured Kaggle
+epoch throughput yet; local control epochs took roughly390-442seconds each.
+
+Completion check: Kaggle and local both finished all3 epochs per arm on3659
+train/1286 val images. Downloaded16 small JSON records plus final session log.
+Kaggle initial DINOv2: proposal MAE23.3002, density MAE23.3515, F1 .69707.
+Unadapted DINOv3: proposal MAE30.5078, density MAE29.2671, F1 .63796.
+Adapted DINOv3 epoch3: proposal MAE23.8235, RMSE86.1903, density MAE26.1452,
+P .75417 R .63720 F1 .69077. Improves strongly over raw swap but does not
+beat original DINOv2 on MAE/F1. Same-budget DINOv2 epoch3 MAE24.0498/F1 .69871;
+best F1 candidate epoch2 MAE23.9852/F1 .70073. These criteria trade off count
+error and localization; no automatic promotion.
+All DINOv3 candidates fail predeclared density MAE guard1.10*23.3515=25.6866;
+remote comparison.json best=null confirms rejection. Local final DINOv3
+MAE23.9199/F1 .69018, similar direction. Three epochs do not establish convergence.
+Results: experiments/backbone_adaptation_results_20261118.json and
+outputs/kaggle/nadthien__countyolo-backbone-adaptation-20261118/adaptation/.
+
+### 2026-11-18: requested10-epoch experiments submitted
+
+- nadthien/countyolo-backbone-adaptation-20261118-e10: fresh matched10 epochs
+  per DINOv2/DINOv3 arm, original exnoise initialization. Same3-epoch protocol
+  and retention guard; frozen image backbones, adaptation of existing heads.
+  Kept original completed job and records; not a3-to10 optimizer continuation.
+- nadthien/countyolo-dinov3-only-finetune-e10-20261118: DINOv3-S/16 sole image
+  backbone, new exemplar-conditioned density/point head. Official within-image
+  exemplar boxes, no text grounding, YOLO, CLIP or SAM in model/inference path.
+  Head warm-up epochs1-2, last2 backbone blocks and final norm unfrozen3-10;
+  head lr1e-4/backbone1e-6, batch4. Full3659train/1286val, no test.
+- DINOv3-only3 unit tests pass: freeze/unfreeze gradients, tiny exemplars,
+  checkpoint round-trip. Pretrained GPU batch4 smoke completed2 epochs through
+  both stages and validation/saving. Compared saved backbone against original:
+  36 tensors changed, all confined to last2 blocks/norm. Smoke is not accuracy.
+- Both jobs independently confirmed RUNNING. Reuse private checksummed cache;
+  no HF tokens in packages. Only-model scores have GT exemplar assistance and
+  cannot be directly ranked against main pipeline text/self-exemplar scores.
+- Ledgers: backbone_adaptation_kaggle_20261118-e10.json and
+  dinov3_only_kaggle_20261118.json. No checkpoint promotion before results.
+
+Completion check of both10-epoch jobs: Kaggle COMPLETE, all10 epochs per arm,
+full1286 validation cases. Downloaded JSON histories/per-image validation metrics.
+Main-pipeline DINOv3 epoch10 proposal MAE23.0210, F1@16 .704165 versus original
+DINOv2 MAE23.3002/F1 .697070; same-budget DINOv2 epoch10 MAE23.9767/F1 .699805.
+This is a small development-validation detection improvement, not test evidence.
+However DINOv3 epoch10 density MAE26.1995 exceeds1.10*23.3515 retention guard.
+Guard-selected DINOv3 checkpoint is epoch5: MAE24.0645/density25.2766/F1 .690542.
+No default promotion; keep epoch10 results distinct from guarded best.pth.
+DINOv3-only best by F1 is epoch9: proposal MAE30.4984/RMSE108.0420,
+density MAE24.8109, P .79445/R .46530/F1 .586872; epoch10 F1 .585011.
+Only-model's official exemplar input differs from main self-exemplar/text task;
+do not present this as a controlled backbone architecture ranking.
+Summary: experiments/dinov3_e10_results_20261118.json. Both ledgers COMPLETE.
+
+### 2026-11-18: semantic-path audit, original and adapted DINOv3
+
+- tools/audit_semantic_path.py ran58 fixed positive validation images plus6
+  sanity cases (two original positives, two reviewed absent elephants, two
+  synthetic mixed prompts). All source images validation-only. No training,
+  no threshold tuning, no general absent-class benchmark claim.
+- Compared YOLO text score maps, coarse density, refined density; decoded YOLO
+  at .05/.15, density3x3 mass .05/.2. Fixed top64 refined proposals per image
+  tested with existing CLIP margin>=0 separately from baseline predictions.
+- Mixed polka-dot target on right: YOLO text-map wrong-half mass fraction .0421
+  (low absolute max confidence .0508). Original coarse .8517 ->refined .995;
+  adapted DINOv3 coarse .9397 ->refined .962. Thus some prompt-dependent spatial
+  signal is present upstream but not preserved by density/refinement. This is
+  observed behavior; does not isolate an individual layer or prove sole cause.
+- No elephants: original refined proposals437/264, adapted432/211, despite
+  YOLO having0 boxes at .15. Correct classes can also have low YOLO confidence,
+  so no unconditional detector-presence veto introduced.
+-58 positive images, adapted refined P .74117/R .58917/F1 .65649 at mass .2.
+  YOLO center-matching recall .07530 at .05 and .02609 at .15; sparse YOLO boxes
+  do not supply sufficient instance centers for these dense counting cases.
+- Fixed64 candidate-pool CLIP gate: original TP1274 ->454, P .6996 ->.6647,
+  recall .4207 ->.1499. Adapted TP1345 ->598, P .7460 ->.7410, recall .4442
+  ->.1975. Gate discards valid detections without precision benefit on this
+  pool; not evidence that CLIP encoder generally fails. Point labels do not
+  give full semantic box-content annotations and large crops may mix concepts.
+- Repeated identical prompt after intervening prompts gives max abs density
+  difference0 for both models; no stale text-cache symptom in this test.
+- Raw maps/proposals: outputs/semantic_path_audit/{original,dinov3_e10}.
+  Summary: experiments/semantic_path_audit_20261118.json. No model/default changes.
+
+### 2026-11-18: proposal ceiling, region/prompt pilots and code logic review
+
+- Oracle audit58 positive val images: refined mass .2 one-to-one center recall
+  .58917 at16px; mass0 maxima .69914. Union of coarse/refined mass0 and YOLO .01
+  after exact-center dedup: .76618. Candidate count8458/GT3028; still23.38% GT
+  unmatched even with perfect selection. Containment coverage is reported
+  separately and never treated as instance recall. Radius8 union recall .57232.
+- Added RegionPromptHead (small region/text adapters), frozen DINOv3 inside and
+  context ROI features plus CLIP crops.23 reviewed training images,12 heldout,
+  six seen classes; own GT exemplar boxes positive, other five classes reviewed
+  absent.37 heldout exemplar regions classified correctly, but this is an easy
+  regional pilot, not whole-pipeline unseen-image or open-world evidence.
+- V1 fixed top128 proposal pools on12 heldout images: learned point F1 .54355
+  vs unfiltered .54072/CLIP .42144. Unfiltered absent mean58.5, learned0, CLIP0.
+  Three heldout mixed scenes: unfiltered R .36697/F1 .40134 vs learned R .17125/
+  F1 .28105; wrong-half proposals271 ->0, but many valid detections also removed.
+- V2 adds GT/context crops from15 train-only class-pair mosaics. Context crops
+  must stay within reviewed source half; no heldout training. Same single-image
+  R .49820/F1 .54355; absent mean .01667. Mixed R/F1 unchanged .17125/.28105;
+  absent mean .75 ->.25. Not promoted: semantic region recognition does not yet
+  preserve candidate recall under mixed-scene/proposal crop distribution shift.
+- Logic fixes: random absent labels removed from default negative/mixed sampler;
+  verified manifest required, unknowns skipped with counts, mosaic absence
+  intersection enforced across all tiles. Wrong-prompt evaluation accepts only
+  reviewed per-image mappings and reports sample count; mixed validation uses
+  mutually reviewed pools. Legacy prompt/presence evaluators require explicit
+  unverified-reproduction flag and label their output invalid as absence GT.
+- Fixed arbitrary-grid exemplar mapping to use patch centers; current80->40
+  mapping unchanged, noninteger ratios corrected. ViT reload key now includes
+  checkpoint revision, preventing stale same-name/same-size backbone reuse.
+-52 tests pass; actual dataset smoke confirms reviewed negatives zeroed and
+  unreviewed images stay positive. Main trainer real-checkpoint4-image smoke
+  completed train/val/save after logic changes; smoke scores not accuracy claims.
+- No production verifier integration or new full training launch: mixed-scene
+  recall gate failed. Next prerequisite is training on realistic proposal crops
+  with spatial/objectness supervision and broader reviewed semantic labels.
+- Summary: experiments/semantic_logic_review_20261118.json. Artifacts:
+  outputs/proposal_ceiling/dinov3_e10 and outputs/region_prompt_pilot/{v1,v2_mixed_train}.
+
+- Official DINOv3-S/16 access now works. Frozen backbone, same-image official
+  positive exemplar boxes; no text model, no trained detection head.
+- First run54/58 with4 tiny-exemplar pooling failures. Fixed fractional-area
+  box/patch pooling; separate full58 run retained original threshold0.65,
+  size640, local maximum radius1. Five decoder tests passed.
+- Full58: MAE41.2759, RMSE73.2485, P@16 .18328, R@16 .16513, F1@16 .17373.
+  Qualitative previews show background false peaks and crowded-object misses.
+- Raw cosine baseline rejected for promotion. Not a comparison of trained
+  DINOv3 vs GroundingDINO; prompt inputs differ from prior text-only experiments.
+- Results: outputs/dinov3_static/pilot58_area_pool/results.json;
+  experiments/dinov3_static_results_20261118.json. No test-set tuning.
+
+- Runner: tools/train_semantic_pilot.py. Two arms from identical exnoise weights,
+  seed1811, AdamW lr1e-5, 90 updates, batch2; frozen backbone and BN statistics,
+  self-exemplars, existing refined/coarse density and regional count losses.
+- Assistant visually reviewed six contact sheets, not exhaustive human labels.
+  Excluded ambiguous market image77. Official train images only: 23 training,
+  12 image-heldout, six seen classes. Verified absence restricted to these six
+  classes. 60 heldout absent prompts and 24 synthetic two-class prompt cases.
+  Separate fixed58 validation positives guard retention; no FSC147 test used.
+- Positive-only control vs semantic cycle (positive, positive/absent pair,
+  two prompts on same mixed image). Matched optimizer steps, not image exposure.
+  Two target tests pass: paired image equality, mass preservation, spatial/point
+  transforms, negative labels without mutating positives.
+- Baseline -> positive control -> semantic: absent mean density75.2923 ->
+  61.5571 ->48.1283; all three still produce proposals for100% of absent prompts.
+  Mixed wrong-half fraction .42544 ->.44993 ->.41862; mixed point F1
+  .42528 ->.43238 ->.41664. Lower wrong-half mass alone is not recognition gain.
+- Fixed58 validation density MAE20.8906 ->23.3448 ->28.8221; proposal MAE
+  20.3966 ->20.8276 ->21.4828; point F1 .63896 ->.62500 ->.61638.
+  Seen-class positive density MAE18.1658 ->15.6683 ->22.9860.
+- Semantic checkpoint FAILS predeclared retention guard. No promotion, defaults
+  or active checkpoint changed. Evidence suggests suppression/generalization
+  loss; this tiny90-step pilot does not prove semantic training cannot work.
+- Audit: experiments/semantic_pilot_manifest_20261117.json;
+  experiments/semantic_pilot_results_20261117.json. Full per-case outputs,
+  source snapshot and both checkpoints: outputs/semantic_training/pilot_v1.
+
+### 2026-11-18: Proposal point head and center-offset pilot
+
+- Added models/proposal_point_head.py and reproducible train/eval tools. Frozen
+  best DINOv3+YOLO-World checkpoint SHA256 remains
+  05a90c22c05e51590e4e7b0d4b121753f8c306c5379fa09efcc57c093d6a39ef.
+- Cached actual coarse/refined maxima plus low-confidence YOLO proposals,
+  two-scale DINO ROI features and spatial density/text-map cues. One-to-one
+  point assignment, ignored ambiguous centers, duplicate/background labels,
+  BCE objectness and center-offset regression. These are localization labels,
+  not verified absent-class labels. No explicit text embedding in this head.
+- 326 official train images, 1000 updates per variant, seed1811; frozen final
+  thresholds. Fixed58 val: baseline MAE20.3966/F1@16 .65649; v1 filter
+  MAE34.9828/F1 .52878; offset plus4px suppression MAE29.1034/F1 .56212.
+- Follow-up bounded residual initialized at baseline membership, with baseline
+  positives prioritized during assignment: MAE29.9310/F1 .57030 including
+  offsets. This is a second development experiment after inspecting v1,
+  not independent confirmation. Both proposal selection variants rejected.
+- V1 point loss train .22060 vs val .74647; residual .21737 vs .44914.
+  Generalization gap supports concern about class transfer. Does not prove
+  larger training or semantic supervision cannot help. This was a small pilot,
+  not full FSC147 training.
+- Fixed original proposal set plus v1 center offsets: pilot58 F1 .65649 ->
+  .66090; full1286 val F1 .70425 -> .70932, precision .79568 -> .80140,
+  recall .63168 -> .63622. Fullval paired MAE23.0047 unchanged by construction.
+  Use this paired baseline, not older evaluator MAE23.0210. Fullval includes
+  the58 previously inspected images; no independent test claim.
+- Reviewed absent-elephant cases still return437/89 points with v1 offset-NMS
+  vs baseline432/211. Mixed polka-dot prompt still localizes mostly wrongly.
+  Center supervision alone did not solve semantic grounding.
+- 60 regression tests pass, including8 assignment/head tests. Existing best
+  checkpoint and production defaults retained. No new Kaggle run launched.
+- Summary: experiments/proposal_point_head_20261118.json. Per-image results,
+  source metadata, checkpoints and fullval evidence: outputs/proposal_point_head/.
+
+### 2026-11-18: Retired failed experimental paths
+
+- User requested cleaning the code and removing unsuccessful experiments.
+- Removed standalone DINOv3-only, region/text heads, proposal-point/residual
+  heads (including the small offset-only ablation), and semantic fine-tuning
+  pilot sources, launchers and tests specific to retired modules.
+- Deleted their local weights, feature caches, abandoned standalone training
+  smoke weights and stale bytecode:56 files total, 2.054 GiB reclaimed.
+  Small evaluation JSON files remain. Earlier commands and deleted weight/source
+  paths above are historical records and are no longer runnable instructions.
+- Retained main CountYOLO, original baselines, best DINOv3+YOLO-World checkpoint,
+  backbone adaptation, CountVid, SAM2/SAM3, general evaluators and verified-absence
+  safeguards. Removed only the retired region-head test from the shared semantic
+  logic suite; retained its9 checks of the maintained pipeline.
+- 49 remaining regression tests pass; compileall and git diff --check pass.
+  Protected checkpoint SHA256 hashes verified unchanged after cleanup.
+- No Git branches or remote Kaggle jobs/datasets were deleted. Only master and
+  sam3 exist locally; sam3 remains an active supported path.
+- Exact deleted files, sizes and hashes: experiments/cleanup_20261118.json.
+
+### 2026-11-18: Opt-in SAM3 temporal counting identity
+
+- Implemented video/identity.py: offline stitching of native SAM3 tracklets.
+  Keep tracker IDs separate from counting identities. No simultaneous-track
+  merges; require3 consecutive endpoint observations, DINO appearance, motion
+  for short gaps, boundary exit/entry for long gaps, area consistency and mutual
+  candidate margin. Ambiguous cases remain distinct. Gap limits count sampled
+  frames. Native within-track identity switches cannot be corrected here.
+- Frozen pinned DINOv3-S/16 ROI embeddings via video/identity_features.py.
+  Generic features are not instance-ReID training. Optional engine integration
+  and evaluator --identity-mode dinov3; default none. CPU feature extraction
+  default avoids adding SAM3 GPU memory pressure. Callback IDs remain native;
+  stitched counts and mappings are available only at finalization.
+- Delayed lifecycle output filters feature rows together with revoked IDs.
+  Zero-area thin-mask boxes retain native counts without identity evidence.
+- Paired replay of existing aligned_batch8 traces on identical original frames:
+  Penguins1,34frames27->27 (GT28); Penguins2,94frames54->54 (GT59).
+  No new links, no count MAE improvement demonstrated. No SAM3 rerun performed.
+- Controlled3-frame absence and new ID on first3 eligible native tracks per
+  video:6/6 injected fragments recovered with no unrelated accepted links.
+  Uses real DINO image features and native ID as proxy truth; not natural
+  occlusion accuracy. No threshold tuning on these outputs.
+- Long-gap boundary reentry and competing-lookalike cases pass logic tests,
+  but natural long-term ReID remains unvalidated without labeled footage.
+- 50 targeted regression tests pass, including13 identity/engine tests;
+  compileall and git diff --check pass. No default switch or remote job launch.
+- Summary: experiments/sam3_identity_20261118.json; per-case mappings, feature
+  records, hashes and controlled probes: outputs/sam3_identity/.
+
+### 2026-11-18: Submitted full VideoCount SAM3 identity evaluation
+
+- User explicitly requested a Kaggle video evaluation. Submitted one private GPU
+  job: nadthien/countyolo-sam3-identity-video-20261118. Initial state QUEUED,
+  submitted2026-11-18T11:09:04Z; execution/results not yet confirmed.
+- Full13 video/prompt cases and1252 sampled frames: Penguins3/222,
+  Crystals7/246, MOT20-Count3/784. Compare native-ID count and stitched identity
+  count from one SAM3 pass per case; no retraining or validation threshold search.
+- Aligned Ultralytics8.4.204, fp16, object batches8, output/detection confidence.5,
+  DINOv3 appearance on CPU to avoid extra SAM3 GPU memory pressure. Fixed configs.
+- Attached existing private VideoCount, SAM3 and DINOv3 adaptation-cache datasets.
+  Verify local-declared SAM3/DINOv3 hashes and exact frame manifests remotely;
+  resolve gated DINOv3 from attached local model files without embedded tokens.
+-31 local association/packaging regression tests passed; payload140425 bytes.
+  Sources and run parameters recorded in run_manifest.json; incremental results,
+  paired_summary.json and traces retained even if another dataset fails.
+- Launcher: launchers/kaggle_sam3_identity.py. Submission ledger:
+  experiments/sam3_identity_kaggle_20261118.json.
+
+- Follow-up check: first attempt ERROR before video evaluation. All13 identity
+  tests passed remotely; parent runner then failed importing video.eval_common
+  because chdir('/kaggle/working') did not add that directory to sys.path when
+  Kaggle executed /kaggle/src/script.py. Not a model-accuracy failure.
+- Fixed explicit parent import path, added a regression executing the actual
+  runner prefix from a separate script directory.14 local tests passed.
+- Retried only after confirming remote ERROR; same13 cases/settings, new source
+  hash d4ab365c7eb5a0745de089765711f1d4197ea468923b318546ee92bd2271239e,
+  submitted2026-11-18T11:55:03Z, initial QUEUED. Attempt history retained in ledger;
+  first attempt log/status archived under the downloaded output/attempt1 folder.
+
+- User requested trying other Kaggle accounts. After initial automatic-review
+  rejection of private input sharing, user explicitly approved read-only access:
+  DINOv3 adaptation cache -> thiend27 and ttdan2006; VideoCount -> ttdan2006.
+  Verified access after update; datasets remain private, SAM3 access already held.
+- Submitted identical payload hash d4ab365c7eb5a0745de089765711f1d4197ea468923b318546ee92bd2271239e
+  to thiend27 and ttdan2006, with independent per-account ledgers. Original
+  nadthien job retained. No model/config changes between accounts.
+- Latest check: thiend27 RUNNING (empty log at check; video inference not yet
+  confirmed), ttdan2006 QUEUED, nadthien QUEUED. No accuracy result available.
+
+- Final check: all3 accounts COMPLETE,13/13 video/prompt cases and1252 frames
+  each, zero failed cases. Verified model hashes, DINO revision, exact per-case
+  frame manifests and identical payload sources/counts across accounts.
+- Paired native SAM3 -> identity MAE: Penguins2.3333 ->2.3333; Crystals72 ->72;
+  MOT20-Count429 ->429. Zero accepted and zero uncertain candidate links.
+  Association did not improve the native counts; not promoted.
+- Penguins predictions27/54/39 vs GT28/59/38. Crystals predictions1/1/8/1/4/1/3
+  vs GT111/154/27/37/109/77/8. MOT20 predictions70/197/7 vs GT80/278/1203.
+  Severe native undercount, particularly MOT20-05, requires detector/prompt/
+  numerics/geometry diagnosis; total-count metrics do not identify its cause.
+- Small records downloaded for all accounts. Canonical verified results:
+  experiments/sam3_identity_kaggle_results_20261118.json. Per-case results and
+  paired_summary.json: outputs/kaggle/<account>__countyolo-sam3-identity-video-20261118/.
+
+### 2026-11-18: SAM3 undercount audit in progress
+
+- Raw IDs already scarce: MOT20-05 raw8 -> emitted7; Crystals023 raw1 ->1.
+  Association and delayed final filtering cannot explain most of the deficit.
+  Detector/tracker load reports contain zero missing parameters/buffers.
+- Earlier FP16/FP32 Crystals image probes were both zero with low concept
+  presence, but first Crystals023 frame is nearly empty; unique-video GT must
+  not be treated as per-frame GT. Need later frames and crowded MOT20 controls.
+- Found local Ultralytics8.4.177 differs from Kaggle8.4.204. Prepared isolated
+  audit dependency; local initialization remained checkpoint-load-bound and
+  produced no accuracy evidence. Stopped local model runs when user explicitly
+  requested SAM3 testing on Kaggle only. No pipeline dependency upgrade applied.
+- Submitted thiend27/countyolo-sam3-detection-audit-20261118, status RUNNING at
+  submission (not yet proof of completed probe). Fixed first/middle/last frames
+  of MOT20-05/Crystals023, first MOT20-01/Penguins1 controls; canonical prompts
+  plus explicit person/crystal diagnostic alternatives, FP16/FP32,3-frame
+  video prefixes, score/presence/mask stats and visual previews. No GT tuning.
+- Verify actual image-byte hashes against sampled dataset manifest, matching
+  SAM3 checksum and pinned Ultralytics8.4.204. Capture detector threshold counts,
+  candidate masklets, native postprocess and removed IDs to localize losses.
+- tools/audit_sam3_detection.py; launchers/kaggle_sam3_audit.py;
+  experiments/sam3_detection_audit_kaggle_20261118.json. Root cause pending probe.
+
+- Probe COMPLETE:28/28 image runs,14 FP16/FP32 pairs,4 prefix diagnostics.
+  All logits/input/masks finite.13 pairs have identical output counts; one
+  MOT20-05/person middle-frame case69 vs68. No catastrophic FP16 failure seen.
+- MOT20-05/human at first/middle/last frames: image counts0/0/0 in both
+  precisions. Person diagnostic alias:49/69/53 FP16,49/68/53 FP32, same.5
+  output threshold. Strong prompt sensitivity confirmed, not full-video MAE gain.
+  Human raw sigmoid>.5:1/3/4 FP16; none>.7. Existing new-track.7 further limits
+  births after initialization. No thresholds or canonical prompts changed.
+- Crystals023/white crystal presence first/middle/last:.06199/.01628/.00982;
+  image counts0/0/0. Crystal alias likewise zero. Low contrast/domain recognition
+  remains unresolved; presence indicates model confidence, not true absence.
+- Prefix MOT20-05 detector counts1/0/2, native output1/1/1; Crystals023
+  detector1/2/1, native1/1/1. Scarcity precedes final identity stitching.
+- Confirmed implementation difference: Ultralytics image postprocess multiplies
+  raw class sigmoid by presence; video extractor does not. Port detector uses
+  supervise_joint_box_scores=False, while audited Meta video builder enables it.
+  This can expose false positives in low-presence videos; adding presence would
+  suppress more and is not an established remedy for undercount.
+- Kaggle verified actual bytes of all521 frames in the4 selected clips. Local
+  CPU-only FFV1 roundtrip on9 sampled frames gives exact equality, zero pixel
+  difference. No local SAM3 model inference used for these conclusions.
+- Summary: experiments/sam3_detection_audit_results_20261118.json. Probe artifacts:
+  outputs/kaggle/thiend27__countyolo-sam3-detection-audit-20261118/audit/.
+
+### 2026-11-19: Submitted detector-only FSC147 and VID evaluation
+
+- User requested one Kaggle job evaluating SAM3 detector alone on FSC147 and
+  video data. Submitted nadthien/countyolo-sam3-detector-fsc-vid-20261119,
+  initial QUEUED,2026-11-19T02:05:52Z (09:05:52 Asia/Saigon).
+- SAM3SemanticPredictor image detector/segmentation via Ultralytics8.4.204,
+  fixedconf.5, FP16, input1008, max_grid1. No tracker, temporal association,
+  tiling, fine-tuning, visual exemplars, threshold selection or FSC test access.
+- Entire FSC147 val1286 images: count MAE/RMSE/bias and one-to-one box-center
+  point precision/recall/F1 at8/16 pixels in640-space. Not bbox AP.
+- All1252 exact sampled VideoCount frames, per-frame GT. One missing annotation:
+  Crystals ma2035_039/ma2035_03900364.jpg; predict but exclude from errors, never
+  assign zero.1251 canonical frame labels. Separate person_alias arm on all784
+  MOT20 frames, retaining canonical human.3322 independent image/prompt calls.
+- Report per-video frame errors, dataset frame-weighted MAE and video-macro MAE.
+  No unique-video counts or summed per-frame detections presented as unique count.
+- Input preflight checks SAM3/FSC metadata/VID GT hashes and all1252 JPEG hashes.
+  Audited detector checkpoint loading. Incremental JSONL, periodic results and
+  final detector/results.json retained. Model inference only on Kaggle GPU.
+- Six CPU-only protocol tests passed, including missing GT, point matching,
+  partial failure and fake-counter integration that refuses tracker calls.
+- Launcher: launchers/kaggle_sam3_detector_only.py; evaluator:
+  tools/eval_sam3_detector_only.py; ledger:
+  experiments/sam3_detector_only_kaggle_20261119.json. No results yet.
+
+### 2026-11-19: YOLO branch diagnosis and bounded improvement pilots
+
+- User authorized improving/testing the YOLO branch while leaving SAM3 jobs
+  untouched. Retained best DINOv3+YOLO checkpoint SHA256
+  05a90c22c05e51590e4e7b0d4b121753f8c306c5379fa09efcc57c093d6a39ef;
+  hash verified unchanged afterward. No application/default/checkpoint changes.
+- Reused prior58-image evidence:31 images have no YOLO boxes atconf.05;
+  YOLOconf.01 point recall@16 .18197; refined baseline .58917; wide candidate
+  oracle .76618. Fixed-pool semantic filtering cannot recover missing centers.
+- Tested contextual2x2 YOLO crops, unique tile ownership and one-to-one support
+  for coarse/refine density candidates. Kept every original proposal unchanged;
+  no CLIP gate, new learned head, GT inference input or threshold search.
+  Baseline MAE20.3966/F1 .65649 -> recovery20.3448/.65601. Added7 proposals,
+  only1 additional true positive. Rejected for retention; no fullval promotion.
+- Detector-only control S-v1 vs S-v2 vs L-v2, same58 images and prompt/CLIP
+  precision setup. Atconf.01 recall .18197/.17734/.20079; F1 .29560/.27954/.31068.
+  Larger detector gives limited recall gain; not enough evidence to replace
+  the trained density pipeline. New weights kept separate in experiment output.
+- Official exemplar-center diagnostic (annotation input, not deployable):
+  baseline MAE20.3966 ->18.5345, precision .74117 ->.81781, recall .58917 ->
+  .58851, F1 .65649 ->.68446. Location selection contributes to false positives;
+  this is not evidence of a text-only deployment improvement or perfect oracle.
+- Tested fixed GT-free detector-supported exemplar policy,conf.15, unique
+  coarse peak within16px, maximum3 exemplars, self fallback otherwise. Activated
+  on12/58 images; MAE20.8966/F1 .65208, recall .58058. Rejected. Do not use
+  detector confidence alone as a reliable exemplar selector.
+- No training, new full1286 validation or video test launched: deployable
+  candidates failed pilot retention.58 images were already used in development,
+  not an independent test. Further training needs labeled region/text alignment
+  for exemplar selection, not unverified whole-image absence labels.
+- Summary: experiments/yolo_improvement_pilot_20261119.json. Results:
+  outputs/yolo_recovery/{pilot_20261119,exemplar_oracle_20261119,
+  exemplar_policy_20261119}/ and outputs/yolo_detector_compare/20261119/.
+
+### 2026-11-19: Learned region/text exemplar ranker submitted
+
+- User selected improving prompt-conditioned region exemplar selection. Added
+  a separate ExemplarRanker: frozen CLIP region base plus norm-bounded DINOv3
+  adapter into CLIP space, explicit text similarity and4-cue quality residual.
+  Zero-initialized output preserves exact self fallback; unchanged rank order
+  also falls back. No learned text-presence veto or final detection filtering.
+- Train3,647 official FSC train images,89 classes; exclude12 reviewed images
+  from new selector training. Base counter had already seen official train, so
+  image-heldout status applies only to this selector.30 verified cross-class
+  mosaics, both prompts, using mutual reviewed absence; all35 reviewed image
+  hashes checked locally and again in training.
+- Rank real coarse-peak candidate locations (budget128, original baseline slots
+  retained). Candidate center<=8px from target GT is positive; >24px negative
+  localization anchor; intervening candidates ignored. These are not absent
+  whole-image labels. Positive candidate class CE uses train classes only.
+- AdamW lr3e-4, fixed2,000updates,7 class-balanced single images +1 mixed per
+  batch when available. Ranking loss +.1 class CE +.01 residual penalty. Train
+  only selector; YOLO/DINO/counting heads/matchers and CLIP remain frozen.
+- Final-only checkpoint; pilot58 must show improvement with MAE/F1/recall/density
+  retention; reviewed mixed and absence guards must also pass before full1286
+  validation. No test-set use and no automatic production promotion.
+-17 local CPU tests passed: ranker/conditioning, semantic safeguards and complete
+  materialized Kaggle module import. No pretrained model test needed locally.
+- Submitted nadthien/countyolo-exemplar-region-text-20261119, initial QUEUED,
+  2026-11-19T02:55:55Z (09:55:55 Asia/Saigon). No accuracy result yet.
+  Payload SHA2560259579667bc2c36c98ca08b354d6e88af0f8164bc941e244b0ed1667bd6cf33.
+- Reuse private DINO cache and original e10 kernel output on the same account;
+  checkpoint hash verified05a90c...d6a39ef. Public YOLO asset bytes verified
+  identical to local095f5266...ee251cf. No new private-data readers and no SAM3
+  job changes. Ledger: experiments/exemplar_ranker_kaggle_20261119.json.
+
+- Ranker final check COMPLETE:3,647 cached single images,60 mixed records,
+  94,104 positive anchors, fixed2,000 updates. Verified payload sources and
+  frozen counting checkpoint against submission manifest.
+- Pilot58 paired Kaggle baseline -> ranked: MAE20.3966 ->19.6034;
+  F1 .65636 ->.66667; recall .58884 ->.58620; density MAE23.4774 ->23.5412.
+  Mixed6 prompts: MAE89.1667 ->91.5, F1 .54954 ->.53773,
+  recall .59786 ->.56116. Reviewed absent2: mean false proposals321.5 ->337.
+  Mixed and absence guards FAIL. No full1286 evaluation or promotion.
+- Downloaded ranker_final.pth536596 bytes, SHA256
+  7d50816d0b813b71ae99a00dd8dc6e77fcf168113f9fe4941dbd9737408e0175.
+  Existing baseline/default remains unchanged. Canonical summary:
+  experiments/exemplar_ranker_results_20261119.json.
+
+- Concurrent detector-only SAM3 job ERROR before evaluation: constructed
+  mot20-frame-level-counts-gt.json instead of upstream MOT20-frame-level-counts-gt.json.
+  Case-insensitive Windows hid this path bug; Linux correctly rejected it.
+  Added shared case-preserving frame_count_annotation() and filename regression.
+ 20 protocol/identity tests passed; retried only after verifying remote ERROR.
+  Same evaluation configuration, new payload
+  afbb5bb0a62dd0eafc00a127c49f00513e8b24f84bb9ba21416a7525cccb4b32,
+  submitted2026-11-19T04:22:49Z (11:22:49 Asia/Saigon), initial QUEUED.
+  Initial error logs archived under downloaded output/attempt1.
+
+
+## 2026-11-22 — Archived Best Open-World Counting Checkpoints (LLMDet v3 & OV-DQUO v1) + OV-DQUO v3.1
+
+- **LLMDet v3 Text-Only (`ttdan2006/countyolo-llmdet-text-v3-20261121`, commit `45b75d5`):**
+  - Full-Val (1,190 images): `fullval_tiled @0.26 MAE = 10.42, F1 = 0.818`, `fullval_raw @0.26 MAE = 10.94, F1 = 0.810`, `absent = 0.00`.
+  - Archived checkpoint: `checkpoints/llmdet_v3_text_fullval10.42.pth` (143.5 MB, SHA256 `c25bb7b034d2b202`), result: `experiments/llmdet_v3_text_result_20261121.json`.
+- **OV-DQUO v1 Multimodal (`nadthien/countyolo-ov-dquo-mm-v1-20261122`, `EVA02-CLIP-B/16 @768`, commit `592a8d1`, `best_epoch=4`):**
+  - Full-Val (1,190 images): `fullval_mm_tiled @0.35 MAE = 13.32, F1 = 0.802`, `fullval_mm_raw @0.26 MAE = 13.77, F1 = 0.793`, `fullval_ex_only_raw @0.35 MAE = 14.29, F1 = 0.790`, `fullval_text_raw @0.26 MAE = 14.56, F1 = 0.786`, `absent @0.26 = 0.00`.
+  - Archived checkpoint: `checkpoints/ov_dquo_v1_vitb16_mm_ep4_fullval13.32.pth` (85.4 MB, SHA256 `cf9b85cd9685302c`), results: `experiments/ov_dquo_v1_vitb16_mm_result_20261122.json`, manifest: `experiments/ov_dquo_v1_vitb16_mm_manifest_20261122.json`.
+- **OV-DQUO v3.1 (`ttdan2006/countyolo-ov-dquo-mm-v3-20261122`, `EVA02-CLIP-L/14 @672`):**
+  - Fixed v3 Epoch 1–2 dynamics (5% absent with `normalizer=30.0`, embedding-space stride-8 text residual replacing `softplus(-3.0)`, active-slope `1.5*tanh` visual gate + elementwise `clip_grad_value_(cal_p, 1.0)`, removed muted `mid_mem_fusion`, `best_th_mae` checkpoint selection); 6/6 CPU tests PASS; submitted on `ttdan2006`.
+- Index file: `experiments/BEST_MODELS.md`.

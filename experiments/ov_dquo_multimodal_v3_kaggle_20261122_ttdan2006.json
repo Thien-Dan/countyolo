@@ -1,0 +1,33 @@
+{
+  "ref": "ttdan2006/countyolo-ov-dquo-mm-v3-20261122",
+  "folder": "C:\\Users\\MSII\\OneDrive\\Documents\\countyolo\\kaggle_video_run\\ttdan2006\\countyolo-ov-dquo-mm-v3-20261122",
+  "state": "submitted",
+  "spec": {
+    "mode": "multimodal",
+    "purpose": "OV-DQUO v3 Multimodal Counting (EVA02-CLIP-L/14 + Single-Matcher + Dual-Tower Stride-8 Text/Vis + Interleaved Fusion + 2x Tiling)",
+    "variant": "vitl14",
+    "gdrive_id": "1yQfWsoW9meZtKWhs2e9S9EPwi8lxqJei",
+    "resolution": 672,
+    "epochs": 10,
+    "accumulate": 4,
+    "backbone_lr": 1e-05,
+    "lr": 2e-05,
+    "adapter_lr": 0.00015,
+    "cal_lr": 0.0015,
+    "max_classes": 8,
+    "neg_class_weight": 0.5,
+    "absent_prob": 0.05,
+    "prior_weight": 0.1,
+    "use_exemplars": true,
+    "grad_checkpoint": true,
+    "tile_trigger": 400,
+    "init_kernel": null,
+    "init_dataset": null,
+    "fsc147d_prompts": true,
+    "nms_free": true
+  },
+  "code_sha256": "f574898bbf7bd8c1c4be01248708cffc04dfe66670808499e64a0e55f193e4c2",
+  "submitted_at": "2026-11-22T06:57:20.485077+00:00",
+  "version_number": 1,
+  "remote_state": "KernelWorkerStatus.QUEUED"
+}
