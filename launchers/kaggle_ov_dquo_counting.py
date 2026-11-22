@@ -105,26 +105,26 @@ except BaseException as exc:
 
 MODE_META = {
     'eval': (
-        'countyolo-ov-dquo-eval-20261122',
-        'OV-DQUO Full-Val (raw + 2x2 tiled), Pilot-58, and Absent evaluation',
+        'countyolo-ov-dquo-eval-v2-20261122',
+        'OV-DQUO v2 Full-Val (raw + 2x2 tiled), Pilot-58, and Absent evaluation',
         False,
     ),
     'text': (
-        'countyolo-ov-dquo-text-v1-20261122',
-        'OV-DQUO Text-Only Counting (EVA02-CLIP-B/16 CLIPSelf + 3-Scale MSDeformAttn + 7-Layer Log-AND)',
+        'countyolo-ov-dquo-text-v2-20261122',
+        'OV-DQUO v2 Text-Only Counting (EVA02-CLIP-L/14 CLIPSelf + PromptMemoryFusion + Guided Stage-1 + 3-Scale MSDeformAttn)',
         False,
     ),
     'multimodal': (
-        'countyolo-ov-dquo-mm-v1-20261122',
-        'OV-DQUO Multimodal Counting (EVA02-CLIP-B/16 CLIPSelf + 3-Scale MSDeformAttn + Visual Exemplars + 7-Layer Log-AND)',
+        'countyolo-ov-dquo-mm-v2-20261122',
+        'OV-DQUO v2 Multimodal Counting (EVA02-CLIP-L/14 CLIPSelf + PromptMemoryFusion + Guided Stage-1 + Stride-8 Decoder Exemplars)',
         True,
     ),
 }
 
 
-def prepare(user='ttdan2006', mode='multimodal', variant='vitb16', resolution=768,
-            epochs=14, backbone_lr=1e-5, lr=2.5e-5, adapter_lr=1.5e-4, cal_lr=1.5e-3,
-            max_classes=8, neg_class_weight=0.5, tile_trigger=650, grad_checkpoint=False,
+def prepare(user='thiend27', mode='multimodal', variant='vitl14', resolution=672,
+            epochs=12, backbone_lr=1e-5, lr=2.5e-5, adapter_lr=1.5e-4, cal_lr=1.5e-3,
+            max_classes=8, neg_class_weight=0.5, tile_trigger=400, grad_checkpoint=True,
             init_kernel=None, init_dataset=None):
     slug, purpose, use_exemplars = MODE_META[mode]
     folder = ROOT / 'kaggle_video_run' / user / slug
@@ -192,19 +192,19 @@ def push_with_retry(user, job, attempts=5):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--user', default='ttdan2006')
+    p.add_argument('--user', default='thiend27')
     p.add_argument('--mode', choices=sorted(MODE_META), default='multimodal')
-    p.add_argument('--variant', choices=sorted(GDRIVE_IDS), default='vitb16')
-    p.add_argument('--resolution', type=int, default=768)
-    p.add_argument('--epochs', type=int, default=14)
+    p.add_argument('--variant', choices=sorted(GDRIVE_IDS), default='vitl14')
+    p.add_argument('--resolution', type=int, default=672)
+    p.add_argument('--epochs', type=int, default=12)
     p.add_argument('--backbone-lr', type=float, default=1e-5)
     p.add_argument('--lr', type=float, default=2.5e-5)
     p.add_argument('--adapter-lr', type=float, default=1.5e-4)
     p.add_argument('--cal-lr', type=float, default=1.5e-3)
     p.add_argument('--max-classes', type=int, default=8)
     p.add_argument('--neg-class-weight', type=float, default=0.5)
-    p.add_argument('--tile-trigger', type=int, default=650)
-    p.add_argument('--grad-checkpoint', action='store_true')
+    p.add_argument('--tile-trigger', type=int, default=400)
+    p.add_argument('--no-grad-checkpoint', action='store_true')
     p.add_argument('--init-kernel', default=None)
     p.add_argument('--init-dataset', default=None)
     p.add_argument('--push', action='store_true')
@@ -214,10 +214,10 @@ def main():
         epochs=a.epochs, backbone_lr=a.backbone_lr, lr=a.lr,
         adapter_lr=a.adapter_lr, cal_lr=a.cal_lr,
         max_classes=a.max_classes, neg_class_weight=a.neg_class_weight,
-        tile_trigger=a.tile_trigger, grad_checkpoint=a.grad_checkpoint,
+        tile_trigger=a.tile_trigger, grad_checkpoint=not a.no_grad_checkpoint,
         init_kernel=a.init_kernel, init_dataset=a.init_dataset,
     )
-    ledger = ROOT / f'experiments/ov_dquo_{a.mode}_v1_kaggle_20261122_{a.user}.json'
+    ledger = ROOT / f'experiments/ov_dquo_{a.mode}_v2_kaggle_20261122_{a.user}.json'
     ledger.write_text(json.dumps(job, indent=2), encoding='utf-8')
     if a.push:
         ver, remote_state = push_with_retry(a.user, job)

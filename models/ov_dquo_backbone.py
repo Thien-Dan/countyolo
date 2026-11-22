@@ -639,7 +639,7 @@ class OVDeformableTransformer(nn.Module):
         valid_w = torch.sum(~mask[:, 0, :], 1).float() / float(w)
         return torch.stack([valid_w, valid_h], -1)
 
-    def encode_and_propose(self, srcs: list[Tensor], masks: list[Tensor], pos_embeds: list[Tensor], grad_checkpoint: bool = False):
+    def encode_memory(self, srcs: list[Tensor], masks: list[Tensor], pos_embeds: list[Tensor], grad_checkpoint: bool = False):
         src_flatten, mask_flatten, lvl_pos_flatten, spatial_shapes = [], [], [], []
         for lvl, (src, mask, pos) in enumerate(zip(srcs, masks, pos_embeds)):
             bs, c, h, w = src.shape
@@ -654,23 +654,45 @@ class OVDeformableTransformer(nn.Module):
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
 
         memory = self.encoder(src_flatten, lvl_pos_flatten, spatial_shapes_t, valid_ratios, mask_flatten, grad_checkpoint=grad_checkpoint)
-        output_memory, output_proposals = gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes_t)
-        output_memory = self.enc_output_norm(self.enc_output(output_memory))
-
-        enc_class = self.enc_out_class_embed(output_memory)  # (B, S, 1)
-        enc_coord_unact = self.enc_out_bbox_embed(output_memory) + output_proposals  # (B, S, 4)
-        topk = min(self.num_queries, enc_class.shape[1])
-        topk_inds = torch.topk(enc_class.max(-1)[0], topk, dim=1)[1]
-
-        refpoint_undetach = torch.gather(enc_coord_unact, 1, topk_inds.unsqueeze(-1).expand(-1, -1, 4))
-        tgt_undetach = torch.gather(output_memory, 1, topk_inds.unsqueeze(-1).expand(-1, -1, self.d_model))
-        enc_class_topk = torch.gather(enc_class, 1, topk_inds.unsqueeze(-1))
         return dict(
             memory=memory,
             mask_flatten=mask_flatten,
             spatial_shapes=spatial_shapes_t,
             valid_ratios=valid_ratios,
+        )
+
+    def propose_from_memory(self, memory: Tensor, mask_flatten: Tensor, spatial_shapes: Tensor,
+                            enc_prompt_bias: Optional[Tensor] = None):
+        output_memory, output_proposals = gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes)
+        output_memory = self.enc_output_norm(self.enc_output(output_memory))
+
+        enc_class = self.enc_out_class_embed(output_memory)  # (B, S, 1)
+        enc_coord_unact = self.enc_out_bbox_embed(output_memory) + output_proposals  # (B, S, 4)
+        select_score = enc_class.max(-1)[0]
+        if enc_prompt_bias is not None:
+            select_score = select_score + enc_prompt_bias.to(select_score.dtype)
+        # Mask invalid padded / out-of-range proposals so topk never selects padding
+        invalid = mask_flatten | (~torch.isfinite(output_proposals[..., 0]))
+        select_score = select_score.masked_fill(invalid, -1e4)
+
+        topk = min(self.num_queries, enc_class.shape[1])
+        topk_inds = torch.topk(select_score, topk, dim=1)[1]
+
+        refpoint_undetach = torch.gather(enc_coord_unact, 1, topk_inds.unsqueeze(-1).expand(-1, -1, 4))
+        tgt_undetach = torch.gather(output_memory, 1, topk_inds.unsqueeze(-1).expand(-1, -1, self.d_model))
+        enc_class_topk = torch.gather(enc_class, 1, topk_inds.unsqueeze(-1))
+        if enc_prompt_bias is not None:
+            enc_bias_topk = torch.gather(enc_prompt_bias, 1, topk_inds).unsqueeze(-1)
+            enc_class_topk = enc_class_topk + enc_bias_topk.to(enc_class_topk.dtype)
+        return dict(
             refpoint_undetach=refpoint_undetach,
             tgt_undetach=tgt_undetach,
             enc_class_topk=enc_class_topk,
+            topk_inds=topk_inds,
         )
+
+    def encode_and_propose(self, srcs: list[Tensor], masks: list[Tensor], pos_embeds: list[Tensor], grad_checkpoint: bool = False):
+        enc = self.encode_memory(srcs, masks, pos_embeds, grad_checkpoint=grad_checkpoint)
+        prop = self.propose_from_memory(enc['memory'], enc['mask_flatten'], enc['spatial_shapes'])
+        enc.update(prop)
+        return enc

@@ -267,11 +267,11 @@ def evaluate_ov_dquo(model: OVDQUOCounting, dataset: OVDQUOData, names, device: 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data-root', type=Path, required=True)
-    p.add_argument('--variant', choices=['vitb16', 'vitl14'], default='vitb16')
-    p.add_argument('--checkpoint', type=Path, required=True, help='Official OVDQUO_ViT-B16_LVIS.pth path')
+    p.add_argument('--variant', choices=['vitb16', 'vitl14'], default='vitl14')
+    p.add_argument('--checkpoint', type=Path, required=True, help='Official OVDQUO_ViT-B16_LVIS.pth / ViT-L14_LVIS.pth path')
     p.add_argument('--output', type=Path, required=True)
-    p.add_argument('--resolution', type=int, default=768, help='Square input resolution (multiple of 2*patch_size: 768 or 1024 for vitb16)')
-    p.add_argument('--epochs', type=int, default=14)
+    p.add_argument('--resolution', type=int, default=672, help='Square input resolution (multiple of 2*patch_size: 672/896 for vitl14, 768/1024 for vitb16)')
+    p.add_argument('--epochs', type=int, default=12)
     p.add_argument('--accumulate', type=int, default=4)
     p.add_argument('--backbone-lr', type=float, default=1e-5)
     p.add_argument('--lr', type=float, default=2.5e-5)
@@ -281,7 +281,7 @@ def main():
     p.add_argument('--neg-class-weight', type=float, default=0.5)
     p.add_argument('--use-exemplars', action='store_true')
     p.add_argument('--grad-checkpoint', action='store_true')
-    p.add_argument('--tile-trigger', type=int, default=650)
+    p.add_argument('--tile-trigger', type=int, default=400)
     p.add_argument('--init', type=Path)
     p.add_argument('--eval-only', action='store_true')
     p.add_argument('--no-amp', action='store_true')
@@ -434,8 +434,10 @@ def main():
         eb_g = sum(p.grad.abs().sum().item() for p in model.transformer.enc_out_bbox_embed.parameters() if p.grad is not None)
         ec_g = sum(p.grad.abs().sum().item() for p in model.transformer.enc_out_class_embed.parameters() if p.grad is not None)
         tp_g = sum(p.grad.abs().sum().item() for p in model.transformer.text_proj.parameters() if p.grad is not None)
+        mf_g = sum(p.grad.abs().sum().item() for p in model.mem_fusion.parameters() if p.grad is not None)
+        ep_g = float(model.enc_prompt_prior.grad.abs().sum().item()) if model.enc_prompt_prior.grad is not None else 0.0
         cal_g = sum(p.grad.abs().sum().item() for p in cal_p if p.grad is not None)
-        for lbl, val_g in [('bb_neck', bb_g), ('encoder', enc_g), ('decoder', dec_g), ('enc_bbox', eb_g), ('enc_cls', ec_g), ('text_proj', tp_g), ('cal', cal_g)]:
+        for lbl, val_g in [('bb_neck', bb_g), ('encoder', enc_g), ('decoder', dec_g), ('enc_bbox', eb_g), ('enc_cls', ec_g), ('text_proj', tp_g), ('mem_fusion', mf_g), ('enc_prior', ep_g), ('cal', cal_g)]:
             assert math.isfinite(val_g) and val_g > 0, f'{lbl} bad grad: {val_g}'
         for lvl in range(model.num_dec_layers):
             bg_l = sum(p.grad.abs().sum().item() for p in model.bbox_embed[lvl].parameters() if p.grad is not None)
@@ -446,14 +448,16 @@ def main():
         ex_msg = ''
         if a.use_exemplars:
             vp_g = sum(p.grad.abs().sum().item() for p in model.vis_proj.parameters() if p.grad is not None)
+            dv_g = sum(p.grad.abs().sum().item() for p in model.dec_vis_proj.parameters() if p.grad is not None)
             si_g = sum(p.grad.abs().sum().item() for p in model.sim_inject.parameters() if p.grad is not None)
             assert math.isfinite(vp_g) and vp_g > 0, f'vis_proj bad grad: {vp_g}'
+            assert math.isfinite(dv_g) and dv_g > 0, f'dec_vis_proj bad grad: {dv_g}'
             assert math.isfinite(si_g) and si_g > 0, f'sim_inject bad grad: {si_g}'
-            ex_msg = f' vis_proj={vp_g:.4f} sim_inj={si_g:.4f}'
+            ex_msg = f' vis_proj={vp_g:.4f} dec_vis={dv_g:.4f} sim_inj={si_g:.4f}'
         peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else 0.0
         print(
-            f'ov-dquo smoke grad sums: bb={bb_g:.4f} enc={enc_g:.4f} dec={dec_g:.4f} '
-            f'enc_box={eb_g:.4f} enc_cls={ec_g:.4f} tproj={tp_g:.4f} cal={cal_g:.4f}{ex_msg} peak_vram_mb={peak_mb:.1f}',
+            f'ov-dquo v2 smoke grad sums: bb={bb_g:.4f} enc={enc_g:.4f} dec={dec_g:.4f} '
+            f'mem_fus={mf_g:.4f} enc_pr={ep_g:.4f} tproj={tp_g:.4f} cal={cal_g:.4f}{ex_msg} peak_vram_mb={peak_mb:.1f}',
             flush=True,
         )
         clip_all_buckets()
@@ -529,10 +533,12 @@ def main():
             cls_losses.append(float(parts['cls']))
             ctr_losses.append(float(parts['center']))
             if (i + 1) % 200 == 0:
-                diag = f'tb {model.clip_text_bias.item():.2f} ts {(torch.nn.functional.elu(model.clip_text_scale)+1).item():.1f}'
+                mg = 0.5 * torch.tanh(model.mem_fusion.fuse_gate).item()
+                diag = f'tb {model.clip_text_bias.item():.2f} ts {(torch.nn.functional.elu(model.clip_text_scale)+1).item():.1f} mg {mg:.3f} ep {model.enc_prompt_prior.item():.2f}'
                 if a.use_exemplars:
                     alpha = 0.25 + 0.5 * torch.sigmoid(model.mm_alpha).item()
-                    diag += f' vb {model.clip_vis_bias.item():.2f} vs {(torch.nn.functional.elu(model.clip_vis_scale)+1).item():.1f} mm_a {alpha:.2f}'
+                    vm = torch.softmax(model.vis_mix, dim=0).tolist()
+                    diag += f' vb {model.clip_vis_bias.item():.2f} vs {(torch.nn.functional.elu(model.clip_vis_scale)+1).item():.1f} vd {vm[2]:.2f} mm_a {alpha:.2f}'
                 print(
                     'train', epoch, i + 1, len(names),
                     'loss', round(float(np.mean(losses)), 4),

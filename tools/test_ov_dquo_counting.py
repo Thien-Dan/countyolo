@@ -128,8 +128,11 @@ class TestOVDQUOCounting(unittest.TestCase):
             ('enc_out_bbox', list(model.transformer.enc_out_bbox_embed.parameters())),
             ('enc_out_cls', list(model.transformer.enc_out_class_embed.parameters())),
             ('text_proj', list(model.transformer.text_proj.parameters())),
+            ('mem_fusion', list(model.mem_fusion.parameters())),
+            ('enc_prompt_prior', [model.enc_prompt_prior]),
             ('sim_inject', list(model.sim_inject.parameters())),
             ('vis_proj', list(model.vis_proj.parameters())),
+            ('dec_vis_proj', list(model.dec_vis_proj.parameters())),
             ('cal_bucket', cal_p),
         ]:
             gsum = sum(p.grad.abs().sum().item() for p in params if p.grad is not None)
@@ -151,7 +154,10 @@ class TestOVDQUOCounting(unittest.TestCase):
         # Simulate an official OV-DQUO checkpoint (with DDP prefix, label_enc, shared class_embed.0)
         raw_sd = {}
         for k, v in model.state_dict().items():
-            if any(k.startswith(p) for p in ('sim_inject.', 'clip_text_', 'vis_proj.', 'vis_mix', 'clip_vis_', 'mm_alpha', 'mm_bias')):
+            if any(k.startswith(p) for p in (
+                'mem_fusion.', 'enc_prompt_prior', 'sim_inject.', 'clip_text_',
+                'vis_proj.', 'dec_vis_proj.', 'vis_mix', 'clip_vis_', 'mm_alpha', 'mm_bias',
+            )):
                 continue
             if k.startswith('class_embed.') and not k.startswith('class_embed.0.'):
                 continue
@@ -168,7 +174,9 @@ class TestOVDQUOCounting(unittest.TestCase):
         img = Image.fromarray(np.random.default_rng(11).integers(0, 255, (128, 192, 3), dtype=np.uint8))
         ex = torch.tensor([[0.1, 0.1, 0.4, 0.4]], dtype=torch.float32)
         ex_feats = model.encode_exemplars(img, ex)
-        self.assertEqual(tuple(ex_feats.shape), (1, 32))
+        self.assertIsInstance(ex_feats, dict)
+        self.assertEqual(tuple(ex_feats['ex_clip'].shape), (1, 32))
+        self.assertEqual(tuple(ex_feats['ex_mem'].shape), (1, 32))
         crop = img.crop((0, 0, 96, 64))
         with torch.no_grad():
             qb, ql = model(crop, 'apples', exemplar_feats=ex_feats, use_text=True)
