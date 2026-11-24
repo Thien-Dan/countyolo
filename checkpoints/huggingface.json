@@ -1,7 +1,7 @@
 {
   "repo_id": "ThienDan2705/countyolo-checkpoints",
   "repo_type": "model",
-  "revision": "ccac14ae708dbc7a2db607732a137d723924a791",
+  "revision": "965d852ce6e4c5d2eb1e393224c74fce9d2341dd",
   "private": false,
   "files": [
     {
@@ -54,6 +54,60 @@
       "sha256": "2647878d5dfa5098f2f8649825738a9345572bae2d4350a2468587ece47dd318",
       "source": "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt",
       "license": "licenses/SAM2-LICENSE.txt"
+    },
+    {
+      "path": "checkpoints/ov_dquo_v2_vitl14_mm_ep12_fullval10.85.pth",
+      "filename": "ov_dquo_v2_vitl14_mm_ep12_fullval10.85.pth",
+      "group": "ov_dquo",
+      "size": 95292321,
+      "md5": "6367292291685960f07d8caf132ae4d1",
+      "sha256": "1bb9af9066056d07a65f4aaf5561ff1eb51f2c637585d7856001b924d7588e25",
+      "note": "Flagship OV-DQUO v2 (ViT-L/14 @672, ep12): Full-Val 10.85 MAE / 0.830 F1, VideoCount 26.91 MAE"
+    },
+    {
+      "path": "checkpoints/ov_dquo_v31_vitl14_mm_ep8_fullval11.08.pth",
+      "filename": "ov_dquo_v31_vitl14_mm_ep8_fullval11.08.pth",
+      "group": "ov_dquo",
+      "size": 98206962,
+      "md5": "7f64187b52232f0f4025df19aae76f44",
+      "sha256": "28f0981cafe35ebc1b7b765c45963d997421c8d3a496cd9f1a782fc94160ae29",
+      "note": "OV-DQUO v3.1 (ViT-L/14 @672, ep8): Full-Val 11.08 MAE / 0.824 F1, absent@0.26=3.50, VideoCount 30.73 MAE"
+    },
+    {
+      "path": "checkpoints/ov_dquo_v1_vitb16_mm_ep4_fullval13.32.pth",
+      "filename": "ov_dquo_v1_vitb16_mm_ep4_fullval13.32.pth",
+      "group": "ov_dquo",
+      "size": 85374469,
+      "md5": "04720ff0771b16a121226a9d2e3c4375",
+      "sha256": "cf9b85cd9685302c9729bb60dd29ed99e084302b723b2696fa41aee15122c6ef",
+      "note": "OV-DQUO v1 (ViT-B/16 @768, ep4): Full-Val 13.32 MAE / 0.802 F1, absent@0.26=0.00, VideoCount 36.82 MAE"
+    },
+    {
+      "path": "checkpoints/llmdet_v3_text_fullval10.42.pth",
+      "filename": "llmdet_v3_text_fullval10.42.pth",
+      "group": "reference",
+      "size": 143496893,
+      "md5": "d53dbf71a6af264d3ae7a461e6f241ec",
+      "sha256": "c25bb7b034d2b2020e29adacdb2277f704df89edd657b701d8dc988fb046621f",
+      "note": "Archived DINO-family reference LLMDet v3 Text-Only (llmdet_tiny): Full-Val 10.42 MAE / 0.818 F1"
+    },
+    {
+      "path": "checkpoints/ovdquo_vitl14_lvis.pth",
+      "filename": "ovdquo_vitl14_lvis.pth",
+      "group": "ov_dquo_base",
+      "size": 2809203837,
+      "md5": "c3e668dce197d0a68a51836aa386838f",
+      "sha256": "e54a905b99758a8ca95011bb34b7001cac67b03d7b1503b72619c955fd810c7c",
+      "note": "Official pretrained OV-DQUO ViT-L/14 LVIS base weights (required for v2 & v3.1)"
+    },
+    {
+      "path": "checkpoints/ovdquo_vitb16_lvis.pth",
+      "filename": "ovdquo_vitb16_lvis.pth",
+      "group": "ov_dquo_base",
+      "size": 1030220717,
+      "md5": "9e270d99a684b885326f9472cf1397c8",
+      "sha256": "eb4e9d4f983bbc1790bfd806340d5da04ec913a202a11c2722cf925b8a20a9b6",
+      "note": "Official pretrained OV-DQUO ViT-B/16 LVIS base weights (required for v1)"
     }
   ]
 }

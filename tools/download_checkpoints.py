@@ -24,8 +24,8 @@ def verified(path, item):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--group", choices=("countyolo", "sam3", "countvid", "all"),
-                        default="countyolo", help="Default: small CountYOLO heads only")
+    parser.add_argument("--group", choices=("countyolo", "sam3", "countvid", "ov_dquo", "ov_dquo_base", "reference", "all"),
+                        default="ov_dquo", help="Default: OV-DQUO trained checkpoints (v2 flagship, v3.1, v1)")
     parser.add_argument("--output-dir", type=Path,
                         help="Override destination; place selected files directly in this directory")
     args = parser.parse_args()
