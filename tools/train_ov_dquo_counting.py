@@ -31,7 +31,20 @@ from models.yoloworld_counting import CountingCriterion, xywh_to_xyxy, exemplar_
 from models.ov_dquo_counting import OVDQUOCounting, build_ov_dquo_class_list
 from datasets.yoloworld_counting import load_fsc147d_class_names
 from tools.train_yoloworld_counting import THRESHOLDS, save, totals
-from tools.train_llmdet_counting import make_warmup_cosine_scheduler
+
+
+def make_warmup_cosine_scheduler(optimizer, total_steps: int, warmup_steps: int = 400, min_lr_ratio: float = 0.1):
+    """Linear warmup from min_lr_ratio -> 1.0, then smooth cosine decay back to min_lr_ratio."""
+    total_steps = max(1, total_steps)
+    warmup_steps = min(warmup_steps, max(1, total_steps // 4))
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return min_lr_ratio + (1.0 - min_lr_ratio) * (step / max(1, warmup_steps))
+        progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+        return min_lr_ratio + 0.5 * (1.0 - min_lr_ratio) * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def prepare_ov_dquo_sample(image: Image.Image, record: dict, flip=False, crop_scale_range=None, max_queries=1000):

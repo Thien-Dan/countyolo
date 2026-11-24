@@ -1,0 +1,111 @@
+{
+  "architecture": "OV-DQUO-Deformable-Counting-v1",
+  "threshold": 0.26,
+  "tile_trigger": 650,
+  "window": 3,
+  "batch_size": 30,
+  "datasets": {
+    "penguins": {
+      "sam2": {
+        "complete": true,
+        "expected": 3,
+        "n": 3,
+        "failed": 0,
+        "mae": 7.333333333333333,
+        "rmse": 9.128709291752768,
+        "bias": -7.333333333333333,
+        "wape": 0.176,
+        "sec": 11522.56,
+        "fps": 0.019266551877360587
+      },
+      "stitched": {
+        "complete": true,
+        "expected": 3,
+        "n": 3,
+        "failed": 0,
+        "mae": 7.333333333333333,
+        "rmse": 9.128709291752768,
+        "bias": -7.333333333333333,
+        "wape": 0.176,
+        "sec": 11522.56,
+        "fps": 0.019266551877360587
+      }
+    },
+    "crystals": {
+      "sam2": {
+        "complete": true,
+        "expected": 7,
+        "n": 7,
+        "failed": 0,
+        "mae": 53.0,
+        "rmse": 71.3672594001319,
+        "bias": -53.0,
+        "wape": 0.7093690248565966,
+        "sec": 3914.61,
+        "fps": 0.06284150911585062
+      },
+      "stitched": {
+        "complete": true,
+        "expected": 7,
+        "n": 7,
+        "failed": 0,
+        "mae": 53.0,
+        "rmse": 71.3672594001319,
+        "bias": -53.0,
+        "wape": 0.7093690248565966,
+        "sec": 3914.61,
+        "fps": 0.06284150911585062
+      }
+    },
+    "mot20": {
+      "sam2": {
+        "complete": false,
+        "expected": 3,
+        "n": 1,
+        "failed": 0,
+        "mae": 12.0,
+        "rmse": 12.0,
+        "bias": -12.0,
+        "wape": 0.15,
+        "sec": 3274.57,
+        "fps": 0.015879947596172932
+      },
+      "stitched": {
+        "complete": false,
+        "expected": 3,
+        "n": 1,
+        "failed": 0,
+        "mae": 12.0,
+        "rmse": 12.0,
+        "bias": -12.0,
+        "wape": 0.15,
+        "sec": 3274.57,
+        "fps": 0.015879947596172932
+      }
+    }
+  },
+  "overall_sam2": {
+    "complete": false,
+    "expected": 13,
+    "n": 11,
+    "failed": 0,
+    "mae": 36.81818181818182,
+    "rmse": 57.245087125446844,
+    "bias": -36.81818181818182,
+    "wape": 0.5563186813186813,
+    "sec": 18711.74,
+    "fps": 0.027790039835953254
+  },
+  "overall_stitched": {
+    "complete": false,
+    "expected": 13,
+    "n": 11,
+    "failed": 0,
+    "mae": 36.81818181818182,
+    "rmse": 57.245087125446844,
+    "bias": -36.81818181818182,
+    "wape": 0.5563186813186813,
+    "sec": 18711.74,
+    "fps": 0.027790039835953254
+  }
+}

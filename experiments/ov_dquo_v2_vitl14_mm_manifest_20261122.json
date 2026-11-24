@@ -1,0 +1,21 @@
+{
+  "architecture": "OV-DQUO-Deformable-Counting-v2",
+  "variant": "vitl14",
+  "resolution": 672,
+  "num_queries": 1000,
+  "epochs": 12,
+  "accumulate": 4,
+  "backbone_lr": 1e-05,
+  "lr": 2.5e-05,
+  "adapter_lr": 0.00015,
+  "cal_lr": 0.0015,
+  "max_classes": 8,
+  "neg_class_weight": 0.5,
+  "use_exemplars": true,
+  "modality_dropout": "40% text-only / 35% multimodal / 25% exemplar-only",
+  "tile_trigger": 400,
+  "init": null,
+  "eval_only": false,
+  "trainable_parameters": 23800622,
+  "nms_free": true
+}

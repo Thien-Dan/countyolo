@@ -12,14 +12,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 FILES = [
     'models/yoloworld_counting.py',
-    'models/llmdet_counting.py',
     'models/ov_dquo_backbone.py',
     'models/ov_dquo_counting.py',
     'datasets/yoloworld_counting.py',
     'datasets/fsc147_dataset.py',
     'datasets/density_generator.py',
     'tools/train_yoloworld_counting.py',
-    'tools/train_llmdet_counting.py',
     'tools/train_ov_dquo_counting.py',
     'tools/test_ov_dquo_counting.py',
 ]

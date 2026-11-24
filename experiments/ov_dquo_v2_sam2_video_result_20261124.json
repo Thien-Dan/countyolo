@@ -1,0 +1,111 @@
+{
+  "architecture": "OV-DQUO-Deformable-Counting-v2",
+  "threshold": 0.26,
+  "tile_trigger": 400,
+  "window": 3,
+  "batch_size": 30,
+  "datasets": {
+    "penguins": {
+      "sam2": {
+        "complete": true,
+        "expected": 3,
+        "n": 3,
+        "failed": 0,
+        "mae": 6.333333333333333,
+        "rmse": 9.848857801796104,
+        "bias": -6.333333333333333,
+        "wape": 0.152,
+        "sec": 9861.539999999999,
+        "fps": 0.02251169695605352
+      },
+      "stitched": {
+        "complete": true,
+        "expected": 3,
+        "n": 3,
+        "failed": 0,
+        "mae": 6.333333333333333,
+        "rmse": 9.848857801796104,
+        "bias": -6.333333333333333,
+        "wape": 0.152,
+        "sec": 9861.539999999999,
+        "fps": 0.02251169695605352
+      }
+    },
+    "crystals": {
+      "sam2": {
+        "complete": true,
+        "expected": 7,
+        "n": 7,
+        "failed": 0,
+        "mae": 37.714285714285715,
+        "rmse": 61.7275118102594,
+        "bias": -37.714285714285715,
+        "wape": 0.5047801147227533,
+        "sec": 5971.59,
+        "fps": 0.04119505860248276
+      },
+      "stitched": {
+        "complete": true,
+        "expected": 7,
+        "n": 7,
+        "failed": 0,
+        "mae": 37.714285714285715,
+        "rmse": 61.7275118102594,
+        "bias": -37.714285714285715,
+        "wape": 0.5047801147227533,
+        "sec": 5971.59,
+        "fps": 0.04119505860248276
+      }
+    },
+    "mot20": {
+      "sam2": {
+        "complete": false,
+        "expected": 3,
+        "n": 1,
+        "failed": 0,
+        "mae": 13.0,
+        "rmse": 13.0,
+        "bias": 13.0,
+        "wape": 0.1625,
+        "sec": 3893.11,
+        "fps": 0.013356930577353324
+      },
+      "stitched": {
+        "complete": false,
+        "expected": 3,
+        "n": 1,
+        "failed": 0,
+        "mae": 13.0,
+        "rmse": 13.0,
+        "bias": 13.0,
+        "wape": 0.1625,
+        "sec": 3893.11,
+        "fps": 0.013356930577353324
+      }
+    }
+  },
+  "overall_sam2": {
+    "complete": false,
+    "expected": 13,
+    "n": 11,
+    "failed": 0,
+    "mae": 26.90909090909091,
+    "rmse": 49.66432778710948,
+    "bias": -24.545454545454547,
+    "wape": 0.4065934065934066,
+    "sec": 19726.24,
+    "fps": 0.026360826999975665
+  },
+  "overall_stitched": {
+    "complete": false,
+    "expected": 13,
+    "n": 11,
+    "failed": 0,
+    "mae": 26.90909090909091,
+    "rmse": 49.66432778710948,
+    "bias": -24.545454545454547,
+    "wape": 0.4065934065934066,
+    "sec": 19726.24,
+    "fps": 0.026360826999975665
+  }
+}
